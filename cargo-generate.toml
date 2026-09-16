@@ -1,0 +1,13 @@
+[template]
+cargo_generate_version = ">=0.10.0"
+
+[placeholders]
+project_name = { prompt = "Project name", default = "sentinel-flow-rs" }
+project_description = { prompt = "Project description", default = "Network Security Visibility & Detection Platform in Rust" }
+author_name = { prompt = "Author name", default = "SentinelFlow Team" }
+author_email = { prompt = "Author email", default = "team@sentinelflow.dev" }
+repository = { prompt = "Repository URL", default = "https://github.com/JacobRyu/sentinel-flow-rs" }
+
+[hooks]
+pre = []
+post = []

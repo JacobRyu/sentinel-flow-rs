@@ -1,0 +1,6 @@
+# Clippy configuration
+# https://doc.rust-lang.org/clippy/configuration.html
+
+avoid-breaking-exported-api = true
+too-many-arguments-threshold = 10
+type-complexity-threshold = 350

@@ -1,0 +1,66 @@
+# Workspace-level dependencies for SentinelFlow-rs
+# This file defines shared dependencies used across all workspace crates
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+bincode = "1"
+toml = "0.8"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+
+# Metrics
+prometheus = { version = "0.13", features = ["process"] }
+
+# Configuration
+config = "0.13"
+clap = { version = "4", features = ["derive", "env"] }
+
+# Network / Packet Capture
+pnet = "0.34"
+socket2 = "0.5"
+
+# Storage
+clickhouse = { version = "0.11", features = ["time", "uuid", "native-tls"] }
+
+# Kubernetes
+kube = { version = "0.87", features = ["client", "derive", "runtime"] }
+k8s-openapi = { version = "0.21", features = ["v1_28"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5"
+parking_lot = "0.12"
+bytes = "1"
+rand = "0.8"
+bitflags = "2"
+rustc-hash = "1"
+ahash = "0.8"
+
+# Time
+humantime = "2"
+humantime-serde = "1"
+
+# Hashing (for flow keys)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Testing
+[dev-dependencies]
+tokio-test = "0.4"
+pretty_assertions = "1"
+criterion = { version = "0.5", features = ["html_reports"] }

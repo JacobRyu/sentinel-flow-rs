@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sentinel-flow-sensor
+  namespace: sentinel-flow
+  labels:
+    app: sentinel-flow-sensor
+spec:
+  selector:
+    matchLabels:
+      app: sentinel-flow-sensor
+  template:
+    metadata:
+      labels:
+        app: sentinel-flow-sensor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: sentinel-flow-sensor
+      hostNetwork: false
+      containers:
+      - name: sensor
+        image: sentinel-flow-sensor:local
+        imagePullPolicy: Never
+        args:
+          - "--config"
+          - "/etc/sentinel-flow/sensor.yaml"
+        securityContext:
+          capabilities:
+            add:
+              - NET_RAW
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: false
+          seccompProfile:
+            type: RuntimeDefault
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+        ports:
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 2
+        volumeMounts:
+        - name: config
+          mountPath: /etc/sentinel-flow
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: config
+        configMap:
+          name: sentinel-flow-config
+      - name: tmp
+        emptyDir: {}
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        effect: NoSchedule

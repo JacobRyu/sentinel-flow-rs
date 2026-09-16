@@ -1,0 +1,32 @@
+# Grafana Helm values for local development
+# Usage: helm install grafana grafana/grafana -n sentinel-flow -f deploy/helm/grafana-values.yaml
+
+adminUser: admin
+adminPassword: admin
+
+persistence:
+  size: 1Gi
+
+service:
+  type: LoadBalancer
+  port: 3000
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: ClickHouse
+        type: grafana-clickhouse-datasource
+        access: proxy
+        url: http://clickhouse:8123
+        jsonData:
+          defaultDatabase: sentinel
+          port: 9000
+          protocol: http
+          tlsSkipVerify: true
+        secureJsonData:
+          password: clickhouse
+
+# Install ClickHouse plugin
+plugins:
+  - grafana-clickhouse-datasource

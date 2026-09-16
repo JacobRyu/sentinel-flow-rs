@@ -1,0 +1,40 @@
+# ClickHouse Helm values for local development
+# Usage: helm install clickhouse clickhouse/clickhouse -n sentinel-flow -f deploy/helm/clickhouse-values.yaml
+
+auth:
+  username: default
+  password: clickhouse
+
+persistence:
+  size: 10Gi
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: 1
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+  ports:
+    http: 8123
+    native: 9000
+
+# Disable unnecessary features for local dev
+metrics:
+  enabled: false
+
+zookeeper:
+  enabled: false
+
+clickhouse:
+  config: |
+    <clickhouse>
+      <logger>
+        <level>information</level>
+      </logger>
+      <tcp_port>9000</tcp_port>
+      <http_port>8123</http_port>
+    </clickhouse>
