@@ -722,20 +722,20 @@ kubectl logs -n sentinel-flow -l app=sentinel-flow-sensor | grep "flow_export"
 kubectl exec -n sentinel-flow -it clickhouse-0 -- clickhouse-client --password clickhouse
 
 # Query recent flows
-SELECT * FROM sentinel.network_flows 
-WHERE timestamp_start > now() - INTERVAL 5 MINUTE 
-ORDER BY timestamp_start DESC 
+SELECT * FROM sentinel.network_flows
+WHERE timestamp_start > now() - INTERVAL 5 MINUTE
+ORDER BY timestamp_start DESC
 LIMIT 10;
 
 # Query security events
-SELECT * FROM sentinel.security_events 
-ORDER BY timestamp DESC 
+SELECT * FROM sentinel.security_events
+ORDER BY timestamp DESC
 LIMIT 10;
 
 # Flow count by source
-SELECT source_ip, count() as flow_count 
-FROM sentinel.network_flows 
-GROUP BY source_ip 
+SELECT source_ip, count() as flow_count
+FROM sentinel.network_flows
+GROUP BY source_ip
 ORDER BY flow_count DESC;
 ```
 
