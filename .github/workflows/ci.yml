@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: rancher-sandbox/setup-cargo-nextest@v1
+      - name: Install cargo-nextest
+        run: cargo install cargo-nextest --locked
       - run: cargo nextest run --workspace --all-features
       - run: cargo doc --workspace --no-deps
 

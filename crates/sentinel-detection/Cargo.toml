@@ -1,0 +1,13 @@
+[package]
+name = "sentinel-detection"
+version = "0.1.0"
+edition = "2024"
+description = "Detection engine for SentinelFlow"
+license = "MIT"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sentinel-flow = { path = "../sentinel-flow" }

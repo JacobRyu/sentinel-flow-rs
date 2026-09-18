@@ -1,0 +1,14 @@
+[package]
+name = "sentinel-enrichment"
+version = "0.1.0"
+edition = "2024"
+description = "Kubernetes metadata enrichment for SentinelFlow"
+license = "MIT"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+sentinel-flow = { path = "../sentinel-flow" }

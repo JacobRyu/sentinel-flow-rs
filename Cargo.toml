@@ -1,11 +1,3 @@
-[package]
-name = "sentinel-flow-rs"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
-description = "Network Security Visibility & Detection Platform in Rust"
-authors = ["SentinelFlow Team"]
-
 [workspace]
 members = [
     "crates/sentinel-sensor",
@@ -65,8 +57,4 @@ dashmap = "5"
 parking_lot = "0.12"
 bytes = "1"
 rand = "0.8"
-
-# Testing
-[dev-dependencies]
-tokio-test = "0.4"
-pretty_assertions = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

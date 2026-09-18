@@ -1,0 +1,25 @@
+[package]
+name = "sentinel-sensor"
+version = "0.1.0"
+edition = "2024"
+description = "Network security sensor for SentinelFlow"
+license = "MIT"
+
+[[bin]]
+name = "sentinel-sensor"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+pnet = { workspace = true, features = ["pnet_datalink"] }
+sentinel-parser = { path = "../sentinel-parser" }
+sentinel-flow = { path = "../sentinel-flow" }
+sentinel-detection = { path = "../sentinel-detection" }

@@ -1,0 +1,11 @@
+[package]
+name = "sentinel-parser"
+version = "0.1.0"
+edition = "2024"
+description = "Network packet parsing library for SentinelFlow"
+license = "MIT"
+
+[dependencies]
+thiserror = { workspace = true }
+pnet = { workspace = true, features = ["pnet_datalink"] }
+bytes = { workspace = true }

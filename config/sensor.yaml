@@ -1,0 +1,23 @@
+capture:
+  interface: eth0
+  buffer_size: 4096
+  snap_len: 65535
+
+flow:
+  inactive_timeout_secs: 30
+  active_timeout_secs: 300
+  max_flows: 100000
+
+output:
+  clickhouse_url: "http://localhost:8123"
+  clickhouse_database: "sentinel"
+  batch_size: 1000
+  batch_timeout_ms: 1000
+
+detection:
+  enabled: true
+  rules_path: "config/rules"
+
+metrics:
+  enabled: true
+  port: 9090
