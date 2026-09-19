@@ -1,0 +1,5 @@
+[advisories]
+ignore = [
+    # protobuf v2.x via prometheus - only affects parsing untrusted input, not our use case
+    "RUSTSEC-2024-0437",
+]
