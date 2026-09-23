@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use capture::PacketCapture;
 use config::SensorConfig;
@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
 
     // Process packets: flow aggregation + periodic sweep in one select! loop
     let flow_config = config.flow.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let processor_handle = tokio::spawn({
         let metrics = metrics.clone();
         async move {
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
             let mut sweep_interval = tokio::time::interval(Duration::from_secs(1));
             let mut packet_count = 0u64;
             let mut byte_count = 0u64;
+            let mut shutdown_rx = shutdown_rx;
 
             loop {
                 tokio::select! {
@@ -83,9 +85,14 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ = sweep_interval.tick() => {
+                        debug!("active_flows={}", processor.active_flows());
                         for exported in processor.sweep() {
                             info!("flow_export: {:?}", exported);
                         }
+                    }
+                    // Ok or Err (sender dropped) both mean shutdown was requested.
+                    _ = &mut shutdown_rx => {
+                        break;
                     }
                 }
             }
@@ -106,7 +113,9 @@ async fn main() -> Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("Shutdown signal received...");
 
-    // Abort capture first: drops tx → processor drains → final sweep → exits
+    // Signal the processor first so its select! breaks even if the capture
+    // task is blocked in a sync read; then abort capture and join.
+    let _ = shutdown_tx.send(());
     capture_handle.abort();
     match tokio::time::timeout(Duration::from_secs(5), processor_handle).await {
         Ok(Ok(())) => info!("Flow processor stopped."),

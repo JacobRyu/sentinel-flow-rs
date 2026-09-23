@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use crate::FlowEntry;
 use crate::FlowKey;
 
-/// Exported flow record
+/// Exported flow record.
+///
+/// `source_ip`/`destination_ip` (and the forward/reverse counters) use the
+/// canonical key orientation (lower-address side), which is not necessarily
+/// the connection initiator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportedFlow {
     pub flow_id: String,

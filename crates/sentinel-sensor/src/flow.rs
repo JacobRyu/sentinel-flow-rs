@@ -1,25 +1,22 @@
 use std::sync::Arc;
 
+use sentinel_flow::{ExportedFlow, FlowError, FlowExporter, FlowKey, FlowTable, FlowTableConfig};
 use sentinel_parser::ParsedPacket;
+use tracing::debug;
 
 use crate::config::FlowConfig;
 use crate::metrics::SensorMetrics;
-
-use sentinel_flow::{ExportedFlow, FlowError, FlowExporter, FlowKey, FlowTable, FlowTableConfig};
-use tracing::debug;
 
 const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 
 /// Aggregates parsed packets into flows and exports them on timeout / FIN / RST.
-#[allow(dead_code)]
 pub struct FlowProcessor {
     table: FlowTable,
     exporter: FlowExporter,
     metrics: Arc<SensorMetrics>,
 }
 
-#[allow(dead_code)]
 impl FlowProcessor {
     pub fn new(config: &FlowConfig, sensor_node: String, metrics: Arc<SensorMetrics>) -> Self {
         let table = FlowTable::new(FlowTableConfig {
@@ -200,5 +197,24 @@ mod tests {
 
         assert_eq!(proc.active_flows(), 1);
         assert_eq!(metrics.packets_dropped.get(), 1);
+    }
+
+    #[test]
+    fn test_table_full_fin_packet_no_export() {
+        let config = FlowConfig { max_flows: 1, ..immediate_expiry_config() };
+        let metrics = test_metrics();
+        let mut proc = FlowProcessor::new(&config, "node-1".into(), metrics.clone());
+
+        // Fill the table with a different 5-tuple
+        proc.on_packet(&make_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 12345, 80, 0x10));
+        assert_eq!(proc.active_flows(), 1);
+
+        // FIN for a NEW unknown 5-tuple: update_flow → TableFull → dropped,
+        // take_flow → None → no export
+        let fin = make_tcp_packet([10, 0, 0, 4], [10, 0, 0, 5], 40000, 443, 0x11);
+        assert!(proc.on_packet(&fin).is_none());
+        assert_eq!(metrics.packets_dropped.get(), 1);
+        assert_eq!(proc.active_flows(), 1);
+        assert_eq!(metrics.flows_exported.get(), 0);
     }
 }

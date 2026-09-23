@@ -93,6 +93,9 @@ impl PacketCapture {
                     packet_count, error_count
                 );
             }
+
+            // Give the runtime an await point so abort() can cancel us.
+            tokio::task::yield_now().await;
         }
 
         info!("Packet capture stopped. Total: {} packets, {} errors", packet_count, error_count);
