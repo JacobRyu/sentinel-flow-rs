@@ -8,4 +8,4 @@ pub use entry::FlowEntry;
 pub use error::FlowError;
 pub use export::{ExportedFlow, FlowExporter};
 pub use key::FlowKey;
-pub use table::FlowTable;
+pub use table::{FlowTable, FlowTableConfig};
