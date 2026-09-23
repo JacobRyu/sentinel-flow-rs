@@ -97,8 +97,8 @@ mod tests {
         let ip1 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1];
         let ip2 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2];
         let key = FlowKey::new(ip1, ip2, 12345, 80, 6);
-        let mut entry = FlowEntry::new(true);
-        entry.update(100, Some(0x02));
+        let mut entry = FlowEntry::new();
+        entry.update(100, Some(0x02), true);
 
         let exporter = FlowExporter::new("node-1".to_string());
         let exported = exporter.export_flow(&key, &entry);

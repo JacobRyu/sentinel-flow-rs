@@ -35,28 +35,41 @@ impl FlowTable {
         Self { config, flows: DashMap::with_capacity_and_shard_amount(1024, 64) }
     }
 
-    /// Update or create a flow
+    /// Update or create a flow.
+    /// The key is canonicalized internally so both directions map to one entry.
     pub fn update_flow(
         &self,
         key: FlowKey,
         bytes: u64,
         tcp_flags: Option<u8>,
     ) -> Result<(), crate::FlowError> {
+        let canonical =
+            FlowKey::canonical(key.src_ip, key.dst_ip, key.src_port, key.dst_port, key.protocol);
+        let is_forward = key == canonical;
+
         // Check if table is full
-        if self.flows.len() >= self.config.max_flows && !self.flows.contains_key(&key) {
+        if self.flows.len() >= self.config.max_flows && !self.flows.contains_key(&canonical) {
             return Err(crate::FlowError::TableFull(self.config.max_flows));
         }
 
         // Update existing flow or create new one
-        if let Some(mut entry) = self.flows.get_mut(&key) {
-            entry.update(bytes, tcp_flags);
+        if let Some(mut entry) = self.flows.get_mut(&canonical) {
+            entry.update(bytes, tcp_flags, is_forward);
         } else {
-            let mut entry = FlowEntry::new(true);
-            entry.update(bytes, tcp_flags);
-            self.flows.insert(key, entry);
+            let mut entry = FlowEntry::new();
+            entry.update(bytes, tcp_flags, is_forward);
+            self.flows.insert(canonical, entry);
         }
 
         Ok(())
+    }
+
+    /// Take a flow out of the table (immediate export on FIN/RST).
+    /// The key is canonicalized internally.
+    pub fn take_flow(&self, key: &FlowKey) -> Option<(FlowKey, FlowEntry)> {
+        let canonical =
+            FlowKey::canonical(key.src_ip, key.dst_ip, key.src_port, key.dst_port, key.protocol);
+        self.flows.remove(&canonical)
     }
 
     /// Get expired flows (inactive or active timeout)
@@ -152,5 +165,53 @@ mod tests {
         table.update_flow(key1, 100, None).unwrap();
         table.update_flow(key2, 100, None).unwrap();
         assert!(table.update_flow(key3, 100, None).is_err());
+    }
+
+    #[test]
+    fn test_flow_table_bidirectional_counts() {
+        let config = FlowTableConfig::default();
+        let table = FlowTable::new(config);
+
+        let ip1 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1];
+        let ip2 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2];
+
+        let fwd = FlowKey::new(ip1, ip2, 12345, 80, 6);
+        let rev = FlowKey::new(ip2, ip1, 80, 12345, 6);
+
+        table.update_flow(fwd, 100, Some(0x02)).unwrap(); // SYN
+        table.update_flow(rev, 50, Some(0x10)).unwrap(); // ACK
+
+        assert_eq!(table.len(), 1, "bidirectional packets must share one entry");
+
+        let flows = table.get_active_flows();
+        let (_, entry) = &flows[0];
+        assert_eq!(entry.packets_forward, 1);
+        assert_eq!(entry.bytes_forward, 100);
+        assert_eq!(entry.packets_reverse, 1);
+        assert_eq!(entry.bytes_reverse, 50);
+        assert!(entry.tcp_flags.syn);
+        assert!(entry.tcp_flags.ack);
+    }
+
+    #[test]
+    fn test_flow_table_take_flow() {
+        let config = FlowTableConfig::default();
+        let table = FlowTable::new(config);
+
+        let ip1 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1];
+        let ip2 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 2];
+
+        // 逆向きで登録
+        let rev = FlowKey::new(ip2, ip1, 80, 12345, 6);
+        table.update_flow(rev, 100, None).unwrap();
+
+        // 正向きキーで take（canonical で同一エントリ）
+        let fwd = FlowKey::new(ip1, ip2, 12345, 80, 6);
+        let taken = table.take_flow(&fwd);
+        assert!(taken.is_some());
+        assert!(table.is_empty());
+
+        let taken_again = table.take_flow(&fwd);
+        assert!(taken_again.is_none());
     }
 }

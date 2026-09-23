@@ -71,14 +71,11 @@ pub struct FlowEntry {
 
     /// Last activity timestamp (for timeout detection)
     pub last_activity: DateTime<Utc>,
-
-    /// Whether this is the forward or reverse direction
-    pub is_forward: bool,
 }
 
 impl FlowEntry {
     /// Create a new flow entry
-    pub fn new(is_forward: bool) -> Self {
+    pub fn new() -> Self {
         let now = Utc::now();
         Self {
             flow_id: uuid::Uuid::new_v4().to_string(),
@@ -90,17 +87,17 @@ impl FlowEntry {
             bytes_reverse: 0,
             tcp_flags: TcpFlags::default(),
             last_activity: now,
-            is_forward,
         }
     }
 
-    /// Update flow with new packet
-    pub fn update(&mut self, bytes: u64, tcp_flags: Option<u8>) {
+    /// Update flow with new packet.
+    /// `is_forward` is true when the packet matches the canonical key orientation.
+    pub fn update(&mut self, bytes: u64, tcp_flags: Option<u8>, is_forward: bool) {
         let now = Utc::now();
         self.timestamp_end = now;
         self.last_activity = now;
 
-        if self.is_forward {
+        if is_forward {
             self.packets_forward += 1;
             self.bytes_forward += bytes;
         } else {
@@ -129,6 +126,12 @@ impl FlowEntry {
     }
 }
 
+impl Default for FlowEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Display for FlowEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -148,25 +151,37 @@ mod tests {
 
     #[test]
     fn test_flow_entry_new() {
-        let entry = FlowEntry::new(true);
+        let entry = FlowEntry::new();
         assert_eq!(entry.packets_forward, 0);
         assert_eq!(entry.bytes_forward, 0);
-        assert!(entry.is_forward);
+        assert_eq!(entry.packets_reverse, 0);
     }
 
     #[test]
-    fn test_flow_entry_update() {
-        let mut entry = FlowEntry::new(true);
-        entry.update(100, Some(0x02)); // SYN
+    fn test_flow_entry_update_forward() {
+        let mut entry = FlowEntry::new();
+        entry.update(100, Some(0x02), true); // SYN
 
         assert_eq!(entry.packets_forward, 1);
         assert_eq!(entry.bytes_forward, 100);
+        assert_eq!(entry.packets_reverse, 0);
         assert!(entry.tcp_flags.syn);
     }
 
     #[test]
+    fn test_flow_entry_update_reverse() {
+        let mut entry = FlowEntry::new();
+        entry.update(50, Some(0x10), false); // ACK (reverse)
+
+        assert_eq!(entry.packets_forward, 0);
+        assert_eq!(entry.packets_reverse, 1);
+        assert_eq!(entry.bytes_reverse, 50);
+        assert!(entry.tcp_flags.ack);
+    }
+
+    #[test]
     fn test_flow_entry_duration() {
-        let entry = FlowEntry::new(true);
+        let entry = FlowEntry::new();
         // Duration should be at least 0ms (u64 is always >= 0)
         let _ = entry.duration_ms();
     }
