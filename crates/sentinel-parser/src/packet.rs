@@ -20,6 +20,18 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+impl Protocol {
+    /// IP protocol number (for FlowKey)
+    pub fn ip_number(&self) -> u8 {
+        match self {
+            Protocol::Tcp => 6,
+            Protocol::Udp => 17,
+            Protocol::Icmp => 1,
+            Protocol::Other(n) => *n,
+        }
+    }
+}
+
 /// Parsed packet with all extracted fields
 #[derive(Debug, Clone)]
 pub struct ParsedPacket {
@@ -29,6 +41,8 @@ pub struct ParsedPacket {
     pub dst_port: u16,
     pub protocol: Protocol,
     pub payload_len: usize,
+    /// TCP flags (raw byte) when protocol is TCP, otherwise None
+    pub tcp_flags: Option<u8>,
 }
 
 impl ParsedPacket {
@@ -91,5 +105,13 @@ mod tests {
         assert_eq!(Protocol::Tcp.to_string(), "TCP");
         assert_eq!(Protocol::Udp.to_string(), "UDP");
         assert_eq!(Protocol::Other(1).to_string(), "OTHER(1)");
+    }
+
+    #[test]
+    fn test_protocol_ip_number() {
+        assert_eq!(Protocol::Tcp.ip_number(), 6);
+        assert_eq!(Protocol::Udp.ip_number(), 17);
+        assert_eq!(Protocol::Icmp.ip_number(), 1);
+        assert_eq!(Protocol::Other(47).ip_number(), 47);
     }
 }
