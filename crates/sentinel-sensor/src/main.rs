@@ -5,11 +5,13 @@ mod metrics;
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use capture::PacketCapture;
 use config::SensorConfig;
+use flow::FlowProcessor;
 use metrics::SensorMetrics;
 
 #[tokio::main]
@@ -49,38 +51,68 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Process packets
-    let processor_handle = tokio::spawn(async move {
-        let mut packet_count = 0u64;
-        let mut byte_count = 0u64;
+    let sensor_node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
 
-        while let Some(packet) = rx.recv().await {
-            packet_count += 1;
-            byte_count += packet.total_len() as u64;
+    // Process packets: flow aggregation + periodic sweep in one select! loop
+    let flow_config = config.flow.clone();
+    let processor_handle = tokio::spawn({
+        let metrics = metrics.clone();
+        async move {
+            let mut processor = FlowProcessor::new(&flow_config, sensor_node, metrics.clone());
+            let mut sweep_interval = tokio::time::interval(Duration::from_secs(1));
+            let mut packet_count = 0u64;
+            let mut byte_count = 0u64;
 
-            // Log first few packets for debugging
-            if packet_count <= 10 {
-                info!("Packet {}: {}", packet_count, packet);
+            loop {
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        let Some(packet) = maybe else { break };
+                        packet_count += 1;
+                        byte_count += packet.total_len() as u64;
+
+                        // Log first few packets for debugging
+                        if packet_count <= 10 {
+                            info!("Packet {}: {}", packet_count, packet);
+                        }
+
+                        metrics.packets_captured.inc();
+                        metrics.bytes_captured.inc_by(packet.total_len() as u64);
+
+                        if let Some(exported) = processor.on_packet(&packet) {
+                            info!("flow_export: {:?}", exported);
+                        }
+                    }
+                    _ = sweep_interval.tick() => {
+                        for exported in processor.sweep() {
+                            info!("flow_export: {:?}", exported);
+                        }
+                    }
+                }
             }
 
-            // Update metrics
-            metrics.packets_captured.inc();
-            metrics.bytes_captured.inc_by(packet.total_len() as u64);
+            // Flush remaining flows on shutdown (capture tx dropped → rx None)
+            for exported in processor.sweep() {
+                info!("flow_export: {:?}", exported);
+            }
 
-            // TODO: Flow aggregation (Phase 2)
-            // TODO: ClickHouse export (Phase 3)
+            info!(
+                "Packet processing stopped. Total: {} packets, {} bytes",
+                packet_count, byte_count
+            );
         }
-
-        info!("Packet processing stopped. Total: {} packets, {} bytes", packet_count, byte_count);
     });
 
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
     info!("Shutdown signal received...");
 
-    // Cleanup
+    // Abort capture first: drops tx → processor drains → final sweep → exits
     capture_handle.abort();
-    processor_handle.abort();
+    match tokio::time::timeout(Duration::from_secs(5), processor_handle).await {
+        Ok(Ok(())) => info!("Flow processor stopped."),
+        Ok(Err(e)) => error!("Flow processor task failed: {}", e),
+        Err(_) => error!("Flow processor shutdown timed out"),
+    }
 
     info!("SentinelFlow Sensor stopped.");
     Ok(())
