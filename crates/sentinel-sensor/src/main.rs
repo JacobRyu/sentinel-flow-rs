@@ -1,5 +1,6 @@
 mod capture;
 mod config;
+mod flow;
 mod metrics;
 
 use anyhow::Result;
