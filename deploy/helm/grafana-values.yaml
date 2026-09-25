@@ -1,5 +1,9 @@
 # Grafana Helm values for local development
-# Usage: helm install grafana grafana/grafana -n sentinel-flow -f deploy/helm/grafana-values.yaml
+# Usage:
+#   helm install grafana grafana/grafana -n sentinel-flow -f deploy/helm/grafana-values.yaml
+#   kubectl -n sentinel-flow create configmap grafana-dashboard \
+#     --from-file=sentinel-flow.json=deploy/grafana/dashboards/sentinel-flow.json
+#   kubectl -n sentinel-flow label configmap grafana-dashboard grafana_dashboard=1
 
 adminUser: admin
 adminPassword: admin
@@ -16,17 +20,32 @@ datasources:
     apiVersion: 1
     datasources:
       - name: ClickHouse
+        uid: sentinel-clickhouse
         type: grafana-clickhouse-datasource
         access: proxy
         url: http://clickhouse:8123
         jsonData:
-          defaultDatabase: sentinel
-          port: 9000
+          host: clickhouse
+          port: 8123
           protocol: http
+          username: default
+          defaultDatabase: sentinel
           tlsSkipVerify: true
         secureJsonData:
           password: clickhouse
+      - name: Prometheus
+        uid: sentinel-prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-server:80
 
 # Install ClickHouse plugin
 plugins:
   - grafana-clickhouse-datasource
+
+# Provision dashboards from ConfigMaps labelled grafana_dashboard=1
+sidecar:
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"

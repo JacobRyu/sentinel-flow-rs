@@ -1,5 +1,5 @@
 use anyhow::Result;
-use prometheus::{Encoder, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 
 /// Sensor metrics for Prometheus
 #[allow(dead_code)]
@@ -10,6 +10,10 @@ pub struct SensorMetrics {
     pub packets_dropped: IntCounter,
     pub active_flows: IntGauge,
     pub flows_exported: IntCounter,
+    pub flows_written: IntCounter,
+    pub flows_dropped: IntCounter,
+    pub clickhouse_write_errors: IntCounter,
+    pub clickhouse_write_duration: Histogram,
 }
 
 impl SensorMetrics {
@@ -42,11 +46,38 @@ impl SensorMetrics {
             "Total flows exported"
         ))?;
 
+        let flows_written = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_flows_written_total",
+            "Total flows written to ClickHouse"
+        ))?;
+
+        let flows_dropped = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_flows_dropped_total",
+            "Total flows dropped due to conversion failure, backpressure, or write failure"
+        ))?;
+
+        let clickhouse_write_errors = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_clickhouse_write_errors_total",
+            "Total failed ClickHouse write attempts (including retries)"
+        ))?;
+
+        let clickhouse_write_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "sentinel_clickhouse_write_duration_seconds",
+                "ClickHouse batch write latency, including retries and backoff; recorded on success",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+        )?;
+
         registry.register(Box::new(packets_captured.clone()))?;
         registry.register(Box::new(bytes_captured.clone()))?;
         registry.register(Box::new(packets_dropped.clone()))?;
         registry.register(Box::new(active_flows.clone()))?;
         registry.register(Box::new(flows_exported.clone()))?;
+        registry.register(Box::new(flows_written.clone()))?;
+        registry.register(Box::new(flows_dropped.clone()))?;
+        registry.register(Box::new(clickhouse_write_errors.clone()))?;
+        registry.register(Box::new(clickhouse_write_duration.clone()))?;
 
         Ok(Self {
             registry,
@@ -55,6 +86,10 @@ impl SensorMetrics {
             packets_dropped,
             active_flows,
             flows_exported,
+            flows_written,
+            flows_dropped,
+            clickhouse_write_errors,
+            clickhouse_write_duration,
         })
     }
 

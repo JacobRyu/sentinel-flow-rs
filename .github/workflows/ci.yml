@@ -23,6 +23,24 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
+    env:
+      # Fail (instead of skip) the ClickHouse integration tests when the
+      # service below is unreachable.
+      REQUIRE_CLICKHOUSE: "1"
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 8123:8123
+          - 9000:9000
+        env:
+          CLICKHOUSE_PASSWORD: ""
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

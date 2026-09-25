@@ -49,6 +49,14 @@ pub struct OutputConfig {
     /// ClickHouse database
     pub clickhouse_database: String,
 
+    /// ClickHouse user (optional)
+    #[serde(default)]
+    pub clickhouse_user: Option<String>,
+
+    /// ClickHouse password (optional)
+    #[serde(default)]
+    pub clickhouse_password: Option<String>,
+
     /// Batch size for writes
     pub batch_size: usize,
 
@@ -61,8 +69,11 @@ impl Default for OutputConfig {
         Self {
             clickhouse_url: "http://localhost:8123".to_string(),
             clickhouse_database: "sentinel".to_string(),
+            clickhouse_user: None,
+            clickhouse_password: None,
             batch_size: 1000,
-            batch_timeout_ms: 1000,
+            // Kept below the <1s export-to-ClickHouse latency budget.
+            batch_timeout_ms: 500,
         }
     }
 }
@@ -126,6 +137,24 @@ impl SensorConfig {
         Ok(config)
     }
 
+    /// Check invariants that deserialization cannot express.
+    ///
+    /// `batch_timeout_ms: 0` would panic inside the writer task (tokio
+    /// intervals require a non-zero period), taking output down silently.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.output.batch_size >= 1,
+            "output.batch_size must be at least 1, got {}",
+            self.output.batch_size
+        );
+        anyhow::ensure!(
+            self.output.batch_timeout_ms >= 1,
+            "output.batch_timeout_ms must be at least 1, got {}",
+            self.output.batch_timeout_ms
+        );
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
         let content = serde_yaml::to_string(self)?;
@@ -143,5 +172,17 @@ mod tests {
         let config = SensorConfig::default();
         assert_eq!(config.capture.interface, "eth0");
         assert_eq!(config.flow.max_flows, 100_000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_output_settings() {
+        let mut config = SensorConfig::default();
+        config.output.batch_size = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = SensorConfig::default();
+        config.output.batch_timeout_ms = 0;
+        assert!(config.validate().is_err());
     }
 }

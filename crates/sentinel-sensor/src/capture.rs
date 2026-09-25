@@ -1,6 +1,8 @@
 use anyhow::Result;
 use pnet::datalink;
 use pnet::datalink::Channel::Ethernet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -24,8 +26,15 @@ impl PacketCapture {
         })
     }
 
-    /// Run packet capture and send parsed packets to channel
-    pub async fn run(&self, tx: mpsc::Sender<sentinel_parser::ParsedPacket>) -> Result<()> {
+    /// Run packet capture and send parsed packets to channel.
+    ///
+    /// `ready` flips to `true` once the datalink channel is up and back to
+    /// `false` when capture stops, driving the `/readyz` probe.
+    pub async fn run(
+        &self,
+        tx: mpsc::Sender<sentinel_parser::ParsedPacket>,
+        ready: Arc<AtomicBool>,
+    ) -> Result<()> {
         info!("Starting packet capture on interface: {}", self.interface);
 
         // Find the network interface
@@ -53,6 +62,7 @@ impl PacketCapture {
         };
 
         info!("Packet capture started. Waiting for packets...");
+        ready.store(true, Ordering::Relaxed);
 
         // Process packets in a loop
         let mut packet_count = 0u64;
@@ -98,6 +108,7 @@ impl PacketCapture {
             tokio::task::yield_now().await;
         }
 
+        ready.store(false, Ordering::Relaxed);
         info!("Packet capture stopped. Total: {} packets, {} errors", packet_count, error_count);
 
         Ok(())

@@ -532,12 +532,13 @@ sensor/
    - Active timeout (default: 5 minutes) — long-lived flow periodic export
    - TCP FIN/RST — connection termination detected
 
-4. **Batched writes**: Flow records are batched (default: 1000 records or 1 second) before writing to ClickHouse to amortize write overhead.
+4. **Batched writes**: Flow records are batched (default: 1000 records or 500 milliseconds) before writing to ClickHouse to amortize write overhead, keeping export-to-write latency under one second.
 
-5. **Backpressure**: If ClickHouse writes fall behind, the sensor applies backpressure by:
-   - Increasing batch sizes
-   - Dropping oldest flow records (with metrics)
-   - Under extreme pressure: sampling flows
+5. **Backpressure**: If ClickHouse writes fall behind (each attempt is bounded by a
+   write timeout, so a hung endpoint retries a fixed number of times), newly exported
+   flow records are dropped once the output channel fills and counted in
+   `sentinel_flows_dropped_total`; packet processing is never stalled. Adaptive batch
+   sizing and sampling under sustained pressure are reserved for a later phase.
 
 ---
 
@@ -1069,18 +1070,27 @@ This correlation is a future capability. For MVP, SentinelFlow operates independ
 
 ### 11.4 Self-Monitoring via Prometheus
 
-The sensor itself exposes Prometheus metrics for operational monitoring:
+The sensor serves Prometheus metrics and health probes on `GET /metrics`,
+`GET /healthz` (liveness) and `GET /readyz` (readiness) at the configured
+`metrics.port` (default 9090):
 
 ```text
-sentinel_flows_active          → Current active flows in memory
-sentinel_flows_exported_total  → Total exported flows
-sentinel_packets_captured_total → Total captured packets
-sentinel_packets_dropped_total  → Dropped packets (buffer full)
-sentinel_flow_export_duration_seconds → Flow export latency
-sentinel_clickhouse_write_duration_seconds → ClickHouse write latency
-sentinel_clickhouse_write_errors_total → ClickHouse write errors
-sentinel_kubernetes_cache_size → Kubernetes metadata cache size
-sentinel_detection_events_total → Total security events generated
+sentinel_packets_captured_total     → Total packets captured
+sentinel_bytes_captured_total       → Total bytes captured
+sentinel_packets_dropped_total      → Dropped packets (buffer full)
+sentinel_flows_active               → Current active flows in memory
+sentinel_flows_exported_total       → Total flows exported by the engine
+sentinel_flows_written_total        → Total flows written to ClickHouse
+sentinel_flows_dropped_total        → Dropped flows (backpressure, conversion, write failure)
+sentinel_clickhouse_write_duration_seconds → ClickHouse write latency (histogram, retries included)
+sentinel_clickhouse_write_errors_total → Failed write attempts (retries included)
+```
+
+Metrics added by later phases:
+
+```text
+sentinel_detection_events_total → Total security events generated (Phase 5)
+sentinel_kubernetes_cache_size  → Kubernetes metadata cache size (Phase 7)
 ```
 
 ---

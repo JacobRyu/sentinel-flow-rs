@@ -16,8 +16,12 @@ data:
     output:
       clickhouse_url: "http://clickhouse:8123"
       clickhouse_database: "sentinel"
+      # Local-dev credentials matching the ClickHouse Helm install in
+      # docs/local-infrastructure.md; production uses a Kubernetes Secret.
+      clickhouse_user: "default"
+      clickhouse_password: "clickhouse"
       batch_size: 1000
-      batch_timeout_ms: 1000
+      batch_timeout_ms: 500
     detection:
       enabled: true
       rules_path: "/etc/sentinel-flow/rules"

@@ -26,24 +26,24 @@ This guide describes how to set up a local Kubernetes environment for developing
 ### Architecture
 
 ```text
-┌─────────────────────────────────────────────────────┐
-│                  Local Kubernetes                    │
-│                                                     │
-│  ┌──────────────────────────────────────────┐      │
-│  │       Rust Security Sensor (DaemonSet)    │      │
-│  │   Packet Capture → Flow Engine → Batch    │      │
-│  └──────────────────────┬───────────────────┘      │
-└─────────────────────────┼────────────────────────────┘
-                          │
-               ┌──────────┴──────────┐
-               │    ClickHouse        │
-               │  (StatefulSet)       │
-               └──────────┬──────────┘
-                          │
-               ┌──────────┴──────────┐
-               │   Grafana            │
-               │  (Deployment)        │
-               └─────────────────────┘
+┌─────────────────────────────────────────────┐
+│              Local Kubernetes                │
+│                                             │
+│  ┌────────────────────────────────────┐    │
+│  │   Rust Security Sensor (DaemonSet) │    │
+│  │ Packet Capture → Flow Engine → Batch│    │
+│  └──────────────┬─────────────────────┘    │
+└─────────────────┼───────────────────────────┘
+                  │
+       ┌──────────┴──────────┐
+       │    ClickHouse        │
+       │  (StatefulSet)       │
+       └──────────┬──────────┘
+                  │
+       ┌──────────┴──────────┐      ┌──────────────────┐
+       │   Grafana            │◄─────│  Prometheus       │
+       │  (Deployment)        │      │  (scrapes sensor) │
+       └─────────────────────┘      └──────────────────┘
 ```
 
 ---
@@ -296,7 +296,38 @@ SETTINGS index_granularity = 8192;
 EOF
 ```
 
-### 4.3 Grafana
+### 4.3 Prometheus
+
+Collects the sensor's self-monitoring metrics. The chart's `kubernetes-pods`
+job honors the `prometheus.io/scrape` annotations on the sensor DaemonSet pods.
+
+#### Installation via Helm
+
+```bash
+# Add repo
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# Install Prometheus
+helm install prometheus prometheus-community/prometheus \
+  --namespace sentinel-flow \
+  --set server.persistentVolume.enabled=false \
+  --set alertmanager.persistentVolume.enabled=false
+```
+
+#### Verify Prometheus
+
+```bash
+# Check pods
+kubectl get pods -n sentinel-flow -l app.kubernetes.io/name=prometheus
+
+# Sensor target appears after the sensor is deployed (section 5)
+kubectl port-forward -n sentinel-flow svc/prometheus-server 9090:80 &
+curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+  | grep -o '"sentinel[^"]*"' | head
+```
+
+### 4.4 Grafana
 
 #### Installation via Helm
 
@@ -305,15 +336,36 @@ EOF
 helm repo add grafana https://grafana.github.io/helm-charts
 helm repo update
 
-# Install Grafana
+# Install Grafana with provisioned data sources and dashboard sidecar
 helm install grafana grafana/grafana \
   --namespace sentinel-flow \
-  --set adminUser=admin \
-  --set adminPassword=admin \
-  --set persistence.size=1Gi \
-  --set service.type=LoadBalancer \
-  --set service.port=3000
+  -f deploy/helm/grafana-values.yaml
 ```
+
+`deploy/helm/grafana-values.yaml` provisions:
+
+- **ClickHouse data source** (uid `sentinel-clickhouse`, plugin
+  `grafana-clickhouse-datasource` installed automatically)
+- **Prometheus data source** (uid `sentinel-prometheus`, points at the
+  Prometheus release from section 4.3)
+- **Dashboard sidecar** that loads any ConfigMap labelled `grafana_dashboard=1`
+
+#### Provision the Dashboard
+
+```bash
+kubectl -n sentinel-flow create configmap grafana-dashboard \
+  --from-file=sentinel-flow.json=deploy/grafana/dashboards/sentinel-flow.json
+kubectl -n sentinel-flow label configmap grafana-dashboard grafana_dashboard=1
+```
+
+The dashboard (`deploy/grafana/dashboards/sentinel-flow.json`) contains:
+
+| Section | Panels | Data source |
+|---|---|---|
+| Sensor health | active flows, capture/drop/export rates, write errors | Prometheus |
+| Flow overview | traffic volume, flows observed, write latency p95 | ClickHouse / Prometheus |
+| Top talkers | protocol mix, top sources, top destinations, top ports | ClickHouse |
+| Recent flows | last 50 flows | ClickHouse |
 
 #### Verify Grafana
 
@@ -323,38 +375,23 @@ kubectl get pods -n sentinel-flow -l app.kubernetes.io/name=grafana
 
 # Get password
 kubectl get secret -n sentinel-flow grafana -o jsonpath="{.data.admin-password}" | base64 -d
+
+# Port forward
+kubectl port-forward -n sentinel-flow svc/grafana 3000:80 &
+
+# Dashboard is registered
+curl -s -u admin:admin http://localhost:3000/api/dashboards/uid/sentinel-flow \
+  | grep -o '"title":"[^"]*"'
+
+# Data sources report healthy
+curl -s -u admin:admin http://localhost:3000/api/datasources/uid/sentinel-clickhouse/health
+curl -s -u admin:admin http://localhost:3000/api/datasources/uid/sentinel-prometheus/health
 ```
 
-#### Add ClickHouse Data Source
+Open http://localhost:3000 (admin/admin) and open **SentinelFlow Overview**.
+The dashboard auto-refreshes every 10 seconds.
 
-```bash
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: grafana-datasource
-  namespace: sentinel-flow
-  labels:
-    grafana_datasource: "1"
-data:
-  sentinel-flow.yaml: |
-    apiVersion: 1
-    datasources:
-      - name: ClickHouse
-        type: grafana-clickhouse-datasource
-        access: proxy
-        url: http://clickhouse:8123
-        jsonData:
-          defaultDatabase: sentinel
-          port: 9000
-          protocol: http
-          tlsSkipVerify: true
-        secureJsonData:
-          password: clickhouse
-EOF
-```
-
-### 4.4 Test Application (Optional)
+### 4.5 Test Application (Optional)
 
 Deploy a simple test application to generate network traffic:
 
@@ -489,8 +526,10 @@ data:
     output:
       clickhouse_url: "http://clickhouse:8123"
       clickhouse_database: "sentinel"
+      clickhouse_user: "default"
+      clickhouse_password: "clickhouse"
       batch_size: 1000
-      batch_timeout_ms: 1000
+      batch_timeout_ms: 500
     detection:
       enabled: true
       rules_path: "/etc/sentinel-flow/rules"
@@ -827,8 +866,10 @@ kubectl exec -n sentinel-flow -it <sensor-pod> -- \
 | `flow.max_flows` | `100000` | Maximum concurrent flows |
 | `output.clickhouse_url` | `http://clickhouse:8123` | ClickHouse HTTP endpoint |
 | `output.clickhouse_database` | `sentinel` | Target database |
+| `output.clickhouse_user` | *(none)* | ClickHouse user; empty = unauthenticated |
+| `output.clickhouse_password` | *(none)* | ClickHouse password (use a Secret in production) |
 | `output.batch_size` | `1000` | Flows per batch |
-| `output.batch_timeout_ms` | `1000` | Max time before flush |
+| `output.batch_timeout_ms` | `500` | Max time before flush |
 | `detection.enabled` | `true` | Enable detection engine |
 | `metrics.enabled` | `true` | Enable Prometheus metrics |
 | `metrics.port` | `9090` | Metrics endpoint port |
@@ -848,6 +889,8 @@ kubectl delete namespace sentinel-flow
 helm list -n sentinel-flow
 helm uninstall clickhouse -n sentinel-flow
 helm uninstall grafana -n sentinel-flow
+helm uninstall prometheus -n sentinel-flow
+kubectl delete configmap grafana-dashboard -n sentinel-flow --ignore-not-found
 
 # Cleanup
 kubectl delete -f deploy/kubernetes/ --ignore-not-found
@@ -858,4 +901,5 @@ kubectl delete -f deploy/kubernetes/ --ignore-not-found
 - [kind Documentation](https://kind.sigs.k8s.io/)
 - [ClickHouse Helm Chart](https://github.com/bitnami/charts/tree/main/bitnami/clickhouse)
 - [Grafana Helm Chart](https://github.com/grafana/helm-charts)
+- [Prometheus Helm Chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/prometheus)
 - [Kubernetes Documentation](https://kubernetes.io/docs/)

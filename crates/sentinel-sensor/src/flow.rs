@@ -80,10 +80,34 @@ impl FlowProcessor {
     }
 }
 
+/// Build a minimal Ethernet+IPv4+TCP frame and parse it.
+#[cfg(test)]
+pub(crate) fn make_tcp_packet(
+    src: [u8; 4],
+    dst: [u8; 4],
+    sport: u16,
+    dport: u16,
+    flags: u8,
+) -> ParsedPacket {
+    let mut data = vec![0u8; 54];
+    data[12] = 0x08;
+    data[13] = 0x00;
+    data[14] = 0x45;
+    data[16..18].copy_from_slice(&40u16.to_be_bytes());
+    data[22] = 64;
+    data[23] = 6; // TCP
+    data[26..30].copy_from_slice(&src);
+    data[30..34].copy_from_slice(&dst);
+    data[34..36].copy_from_slice(&sport.to_be_bytes());
+    data[36..38].copy_from_slice(&dport.to_be_bytes());
+    data[46] = 0x50;
+    data[47] = flags;
+    sentinel_parser::parse_packet(&data).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_parser::parse_packet;
 
     fn test_metrics() -> Arc<SensorMetrics> {
         Arc::new(SensorMetrics::new().unwrap())
@@ -91,30 +115,6 @@ mod tests {
 
     fn immediate_expiry_config() -> FlowConfig {
         FlowConfig { inactive_timeout_secs: 0, active_timeout_secs: 300, max_flows: 100 }
-    }
-
-    /// Build a minimal Ethernet+IPv4+TCP frame and parse it.
-    fn make_tcp_packet(
-        src: [u8; 4],
-        dst: [u8; 4],
-        sport: u16,
-        dport: u16,
-        flags: u8,
-    ) -> ParsedPacket {
-        let mut data = vec![0u8; 54];
-        data[12] = 0x08;
-        data[13] = 0x00;
-        data[14] = 0x45;
-        data[16..18].copy_from_slice(&40u16.to_be_bytes());
-        data[22] = 64;
-        data[23] = 6; // TCP
-        data[26..30].copy_from_slice(&src);
-        data[30..34].copy_from_slice(&dst);
-        data[34..36].copy_from_slice(&sport.to_be_bytes());
-        data[36..38].copy_from_slice(&dport.to_be_bytes());
-        data[46] = 0x50;
-        data[47] = flags;
-        parse_packet(&data).unwrap()
     }
 
     #[test]
