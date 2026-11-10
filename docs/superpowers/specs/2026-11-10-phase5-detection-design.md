@@ -45,12 +45,12 @@ sweep()   → Vec<ExportedFlow> ──┴→ processor select! ループ内で
      │                                └→ Vec<SecurityEvent>
      │                             events_tx (mpsc, cap=1000) へ push
      │                             out_tx (既存フローチャネル) へも引き続き push
-     └ events_rx ◀── SecurityEventWriter (select! loop)
+     └ events_rx ◀── EventWriter (select! loop)
                         └→ ClickHouse security_events
 ```
 
 - `DetectionEngine` は processor タスクから1箇所・同期的に呼び出されるため `Arc`/ロック不要
-- SecurityEventWriter は processor と独立した tokio task、既存 FlowWriter と同じ配線パターン
+- EventWriter は processor と独立した tokio task、既存 FlowWriter と同じ配線パターン
 - 既存 ExportedFlow の security クリティカルフローには影響しない
 
 ## コンポーネント設計
@@ -124,7 +124,7 @@ pub struct SecurityEvent {
 ```
 
 - `source_flow_ids`: MVP では空 `Array(UUID)`（FlowRow ↔ SecurityEvent 相関の解決は Phase 7 metadata強化とともに見直し）
-- kubernetes metadata (`source_pod` 等) は MVP では ClickHouse 側で `NULL` 固定（Phase 7 ワイヤリングの対象）
+- kubernetes metadata (source_pod 等) は Phase 3 の network_flows 前例と同様にカラム自体を Phase 7 まで追加しない（その時点で ALTER TABLE する）。
 
 #### DetectionEngine
 
@@ -155,7 +155,7 @@ if config.detection.enabled {
     // Arc 不使用: engine は processor タスクが単一所有する
     let (events_tx, events_rx) = mpsc::channel(config.detection.event_channel_capacity);
     let event_store = ClickHouseEventStore::new(&config.output)?;
-    let event_writer = SecurityEventWriter::new(events_rx, event_store, ...);
+    let event_writer = EventWriter::new(events_rx, event_store, ...);
     tokio::spawn(event_writer.run());
     // processor に detection_engine を渡す（processor タスクが単一所有者、Arc 不使用）
 }
@@ -165,7 +165,7 @@ if config.detection.enabled {
 - 既存 flow 出力 (out_tx → FlowWriter → ClickHouse flows) と完全に並行
 - `detection.enabled: false` の場合、events チャネル・Engine・writer は生成されない（既存パスのみ）
 
-### 3. SecurityEventWriter
+### 3. EventWriter
 
 - 既存 FlowWriter と同じ select! ループ構造を継承 (batch buffer / flush interval / MAX_RETRIES=3 / RETRY_BACKOFF / WRITE_TIMEOUT=2s)
 - 実装は MVP では flow writer とは分離（Task: `Writer<I,S>` 系のジェネリクス化はこのフェーズで行わない。Phase 6 Kafka の際の一般化とセットで検討）
@@ -254,7 +254,7 @@ detection:
 
 - `security_events` テーブルを architecture.md §7.4 の DDL どおりで作成（既存 flows 用マイグレーションの方式に合わせる）
 - key: `PARTITION BY toYYYYMM(timestamp)`, `ORDER BY (event_type, severity, timestamp)`, `TTL 365d`
-- IPv6 型 (ip columns)、`source_pod Nullable`, `severity Enum8(low=1, medium=2, high=3, critical=4)`
+- IPv6 型 (ip columns)、severity Enum8。	source_pod は含めない（Task 0-1 と同じ理由）。MergeTree()/LowCardinality 非使用は network_flows と同じ deliberate difference。
 
 ### 7. メトリクス (sentinel-sensor/src/metrics.rs)
 
@@ -263,6 +263,7 @@ detection:
 | `sentinel_detection_events_total{rule_id=}` | 発火イベント数 (rule_id label) |
 | `sentinel_detection_windows_active` | SCAN ウィンドウの現在の source IP 数 (gauge) |
 | `sentinel_detection_failed_writes_total` | 書き込み失敗回数 (writer retry 経過で増加) |
+| sentinel_detection_events_written_total | security_events への書込成功行数 (writer) |
 
 ## エラーハンドリング
 
@@ -296,13 +297,12 @@ detection:
 | `crates/sentinel-detection/src/event.rs` | 新規（SecurityEvent 型 + ClickHouse 行変換） |
 | `crates/sentinel-flow/src/...` | 編集なし |
 | `crates/sentinel-sensor/src/main.rs` | 編集（detection section 読み込み・配線、writer spawn） |
-| `crates/sentinel-sensor/src/flow.rs` | 編集（evaluate 呼出し、イベント送信） |
-| `crates/sentinel-sensor/src/output/...` | 編集（SecurityEventWriter, ClickHouseEventStore, 行変換） |
-| `crates/sentinel-sensor/src/metrics.rs` | 編集（3メトリクス追加） |
+| `crates/sentinel-sensor/src/output/...` | 編集（event_row.rs / event_store.rs / event_writer.rs を追加、mod.rs 経由で公開） |
+| `crates/sentinel-sensor/src/metrics.rs` | 編集（4メトリクス追加） |
 | `crates/sentinel-sensor/src/config.rs` | 編集（detection section パース・検証） |
 | `config/detection-rules.yaml` | 新規 |
 | `config/sensor.yaml` | 編集（detection section） |
-| ClickHouse migration (sql) | 新規（security_events テーブル） |
+| （なし） | security_events DDL は起動時 ensure_schema で作成（network_flows と同じ方式） |
 
 ## 検証コマンド
 
