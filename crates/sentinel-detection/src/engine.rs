@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use sentinel_flow::ExportedFlow;
 
@@ -16,8 +16,7 @@ use crate::rules::{
     private_ranges,
 };
 
-/// SCAN ウィンドウ (source IP × window_secs 単位)。再起動で捨てる仕様 (spec 合意)。
-#[allow(dead_code)] // filled in by the Task 4 scan arms
+/// SCAN ウィンドウ (rule id × source IP × window_secs 単位)。再起動で捨てる仕様 (spec 合意)。
 #[derive(Debug)]
 struct ScanWindow {
     destination_ips: HashSet<IpAddr>,
@@ -26,7 +25,6 @@ struct ScanWindow {
     fired: bool, // fires once per window life
 }
 
-#[allow(dead_code)] // filled in by the Task 4 scan arms
 impl ScanWindow {
     fn new() -> Self {
         Self {
@@ -38,7 +36,6 @@ impl ScanWindow {
     }
 }
 
-#[allow(dead_code)] // filled in by the Task 4 scan arms
 #[derive(Debug, Clone, Copy)]
 enum ScanMarker {
     Ports,
@@ -51,7 +48,7 @@ pub struct DetectionEngine {
     allowlist: Vec<CidrRange>,
     private_ranges: Vec<CidrRange>,
     rules: Vec<crate::rules::CompiledRule>,
-    windows: HashMap<(IpAddr, u64), ScanWindow>, // (source_ip, window_secs) → window
+    windows: HashMap<(String, IpAddr, u64), ScanWindow>, // (rule_id, source_ip, window_secs) → window
 }
 
 impl DetectionEngine {
@@ -155,9 +152,97 @@ impl DetectionEngine {
                     rule.mitigation_suggestions.clone(),
                 ))
             }
-            // Task 4 で置き換え: PortScan / NetworkScan arms
-            _ => None,
+            RuleParameters::PortScan { window_secs, threshold } => {
+                let (window_secs, threshold) = (*window_secs, *threshold);
+                // `rule` は `self.rules` を借用したまま。scan 評価は `&mut self` を必要とし
+                // method 呼び出しでは field 分割が効かないため、clone して借用を切る
+                // (brief Step 3 の fallback 方針)。
+                let rule = rule.clone();
+                self.scan_evaluation(
+                    &rule,
+                    flow,
+                    source_ip,
+                    destination_ip,
+                    ScanMarker::Ports,
+                    window_secs,
+                    threshold,
+                )
+            }
+            RuleParameters::NetworkScan { window_secs, threshold } => {
+                let (window_secs, threshold) = (*window_secs, *threshold);
+                let rule = rule.clone();
+                self.scan_evaluation(
+                    &rule,
+                    flow,
+                    source_ip,
+                    destination_ip,
+                    ScanMarker::Addresses,
+                    window_secs,
+                    threshold,
+                )
+            }
         }
+    }
+
+    /// SCAN ルール共通: window 更新 → 閾値チェック → fired 制御 → イベント生成。
+    fn scan_evaluation(
+        &mut self,
+        rule: &crate::rules::CompiledRule,
+        flow: &ExportedFlow,
+        source_ip: IpAddr,
+        destination_ip: IpAddr,
+        marker: ScanMarker,
+        window_secs: u64,
+        threshold: u64,
+    ) -> Option<SecurityEvent> {
+        // 期限切れ window は掃除 (spec: 評価を通じて prune する、背景 task 無し)
+        self.prune_windows();
+
+        let window = self
+            .windows
+            .entry((rule.id.clone(), source_ip, window_secs))
+            .or_insert_with(ScanWindow::new);
+        match marker {
+            ScanMarker::Ports => {
+                window.destination_ports.insert(flow.destination_port);
+            }
+            ScanMarker::Addresses => {
+                window.destination_ips.insert(destination_ip);
+            }
+        }
+        let count = match marker {
+            ScanMarker::Ports => window.destination_ports.len(),
+            ScanMarker::Addresses => window.destination_ips.len(),
+        } as u64;
+
+        if count <= threshold || window.fired {
+            return None;
+        }
+        window.fired = true;
+        let description = fill_template(
+            &rule.description_template,
+            &[("threshold", threshold), ("window_secs", window_secs)],
+        );
+        Some(build_event(
+            &rule.id,
+            &rule.name,
+            rule.severity,
+            rule.confidence,
+            source_ip,
+            destination_ip,
+            flow.destination_port,
+            &flow.protocol,
+            description,
+            rule.tags.clone(),
+            rule.mitigation_suggestions.clone(),
+        ))
+    }
+
+    /// first_seen + window_secs が elapsed した window を落とす (スキャン評価毎に呼ばれる)。
+    fn prune_windows(&mut self) {
+        self.windows.retain(|(_rule_id, _source_ip, window_secs), window| {
+            window.first_seen.elapsed() < Duration::from_secs(*window_secs)
+        });
     }
 
     fn is_allowed(&self, ip: IpAddr) -> bool {
@@ -229,7 +314,6 @@ mod tests {
         )
     }
 
-    #[allow(dead_code)] // used by the Task 4 scan-window tests
     fn window_rule(
         id: &'static str,
         name: &'static str,
@@ -365,5 +449,160 @@ mod tests {
         let events = engine.evaluate(&flow("10.0.0.9", 8080, "8.8.8.8", 22));
         let rule_ids: Vec<&str> = events.iter().map(|event| event.rule_id.as_str()).collect();
         assert_eq!(rule_ids, vec!["EXT-001", "EXT-002"]);
+    }
+
+    /// 接触できない engine.windows の first_seen を窓切れギリギリに戻す。
+    fn expire_window(engine: &mut DetectionEngine, seconds_back: u64) {
+        for window in engine.windows.values_mut() {
+            window.first_seen = Instant::now() - Duration::from_secs(seconds_back);
+        }
+    }
+
+    #[test]
+    fn scan001_fires_once_threshold_crossed() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)])
+                .unwrap();
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 80)).is_empty());
+        let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 22));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule_id, "SCAN-001");
+        assert_eq!(events[0].event_type, "port_scanning");
+        assert_eq!(events[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn scan001_stays_silent_below_threshold() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 5)])
+                .unwrap();
+        for port in [80u16, 443, 22, 1433] {
+            assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", port)).is_empty());
+        }
+    }
+
+    #[test]
+    fn scan001_repeated_destination_port_does_not_grow_window() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)])
+                .unwrap();
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+        // window count = 1 distinct port (threshold 2) so repeated flows on the same port never fire
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+    }
+
+    #[test]
+    fn scan001_does_not_refire_within_window() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)])
+                .unwrap();
+        let mut fired = 0;
+        for port in [443u16, 80, 22] {
+            fired += engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", port)).len();
+        }
+        assert_eq!(fired, 1, "third distinct port crosses the threshold exactly once");
+        assert!(
+            engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 33)).is_empty(),
+            "flow 4 should not fire (fired=true in window)"
+        );
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 55)).is_empty());
+    }
+
+    #[test]
+    fn scan001_window_reset_after_expiry() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)])
+                .unwrap();
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+        expire_window(&mut engine, 61);
+        // 新しい window で再評価 (threshold 2, count=1) → 発火しない、window は新しく作り直し
+        let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443));
+        assert!(events.is_empty());
+        assert_eq!(engine.active_windows(), 1);
+    }
+
+    #[test]
+    fn scan002_counts_distinct_destination_ips() {
+        let mut engine = DetectionEngine::new(
+            Vec::new(),
+            vec![window_rule("SCAN-002", "network_scanning", 60, 2)],
+        )
+        .unwrap();
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty());
+        assert!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.2", 443)).is_empty());
+        let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.3", 443));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule_id, "SCAN-002");
+    }
+
+    #[test]
+    fn scan_windows_are_per_source_ip() {
+        let mut engine =
+            DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)])
+                .unwrap();
+        for port in [443u16, 80, 22] {
+            let _ = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", port));
+        }
+        assert_eq!(engine.active_windows(), 1);
+        // different source IP → 別 window (same window_secs)
+        let _ = engine.evaluate(&flow("10.0.0.20", 49152, "203.0.113.1", 443));
+        assert_eq!(engine.active_windows(), 2);
+    }
+
+    #[test]
+    fn scan001_renders_description_template() {
+        let rule = serde_yaml::from_str::<RuleConfig>(
+            "id: SCAN-001\nname: port_scanning\nrule_type: window\nseverity: critical\nconfidence: 0.9\n\
+             parameters: {window_secs: 60, threshold: 2, description: \"Port scanning detected: over {threshold} distinct ports in {window_secs}s.\"}\n",
+        ).unwrap();
+        let mut engine = DetectionEngine::new(Vec::new(), vec![rule]).unwrap();
+        let _ = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443));
+        let _ = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 80));
+        let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 22));
+        assert_eq!(events[0].description, "Port scanning detected: over 2 distinct ports in 60s.");
+    }
+
+    #[test]
+    fn mixed_rules_emit_in_order_and_delay_window() {
+        let mut engine = DetectionEngine::new(
+            Vec::new(),
+            vec![ext001(), window_rule("SCAN-001", "port_scanning", 60, 2)],
+        )
+        .unwrap();
+        let first = engine.evaluate(&flow("10.0.0.9", 49152, "8.8.8.8", 443)); // EXT-001 fires now
+        assert_eq!(first.len(), 1);
+        let second = engine.evaluate(&flow("10.0.0.9", 49152, "8.8.8.8", 80)); // EXT-001 fires; scan count 2 (未超)
+        assert_eq!(second.len(), 1);
+        let third = engine.evaluate(&flow("10.0.0.9", 49152, "8.8.8.8", 22)); // EXT-001 + SCAN-001
+        let rule_ids: Vec<&str> = third.iter().map(|event| event.rule_id.as_str()).collect();
+        assert_eq!(rule_ids, vec!["EXT-001", "SCAN-001"]);
+    }
+
+    #[test]
+    fn scan001_and_scan002_with_same_window_secs_fire_independently() {
+        let mut engine = DetectionEngine::new(
+            Vec::new(),
+            vec![
+                window_rule("SCAN-001", "port_scanning", 60, 2),
+                window_rule("SCAN-002", "network_scanning", 60, 2),
+            ],
+        )
+        .unwrap();
+        assert!(
+            engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).is_empty(),
+            "1 distinct port/ip does not cross threshold 2"
+        );
+        assert!(
+            engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.2", 80)).is_empty(),
+            "2 distinct ports/ips do not cross threshold 2"
+        );
+        // 3 distinct ports and 3 distinct IPs → both rules cross threshold 2 in the same
+        // flow. With a shared (source_ip, window_secs) key the first rule's `fired` flag
+        // would suppress the second until expiry.
+        let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.3", 22));
+        let rule_ids: Vec<&str> = events.iter().map(|event| event.rule_id.as_str()).collect();
+        assert_eq!(rule_ids, vec!["SCAN-001", "SCAN-002"]);
     }
 }
