@@ -6,18 +6,23 @@ mod output;
 mod server;
 
 use anyhow::Result;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use capture::PacketCapture;
 use config::SensorConfig;
 use flow::FlowProcessor;
 use metrics::SensorMetrics;
-use output::{ClickHouseStore, FlowWriter, WRITE_TIMEOUT};
+use output::{ClickHouseEventStore, ClickHouseStore, EventWriter, FlowWriter, WRITE_TIMEOUT};
+use sentinel_detection::{DetectionEngine, SecurityEvent};
 use sentinel_flow::ExportedFlow;
+
+/// Fallback rules file when `detection.rules_path` is not set.
+const DEFAULT_RULES_PATH: &str = "config/detection-rules.yaml";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,6 +93,36 @@ async fn main() -> Result<()> {
     );
     let writer_handle = tokio::spawn(writer.run());
 
+    // Detection: loaded before the processor starts so rule defects fail fast at startup.
+    let detection = if config.detection.enabled {
+        let rules_path =
+            config.detection.rules_path.clone().unwrap_or_else(|| DEFAULT_RULES_PATH.to_string());
+        let engine = DetectionEngine::load(Path::new(&rules_path))?;
+        info!(rules = engine.rule_count(), rules_path = %rules_path, "detection enabled");
+        Some(engine)
+    } else {
+        info!("detection disabled");
+        None
+    };
+
+    let (events_tx, events_rx) = mpsc::channel(config.detection.event_channel_capacity);
+    let event_writer_handle = if config.detection.enabled {
+        let event_writer = EventWriter::new(
+            events_rx,
+            ClickHouseEventStore::new(&config.output),
+            config.output.batch_size,
+            Duration::from_millis(config.output.batch_timeout_ms),
+            WRITE_TIMEOUT,
+            metrics.clone(),
+        );
+        Some(tokio::spawn(event_writer.run()))
+    } else {
+        // No consumer will drain this receiver; drop it so any stray send is
+        // observed as a closed channel instead of buffering silently.
+        drop(events_rx);
+        None
+    };
+
     let sensor_node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
 
     // Process packets: flow aggregation + periodic sweep in one select! loop
@@ -96,6 +131,7 @@ async fn main() -> Result<()> {
     let processor_handle = tokio::spawn({
         let metrics = metrics.clone();
         async move {
+            let mut detection = detection;
             let mut processor = FlowProcessor::new(&flow_config, sensor_node, metrics.clone());
             let mut sweep_interval = tokio::time::interval(Duration::from_secs(1));
             let mut packet_count = 0u64;
@@ -119,6 +155,7 @@ async fn main() -> Result<()> {
 
                         if let Some(exported) = processor.on_packet(&packet) {
                             info!("flow_export: {:?}", exported);
+                            handle_export(&exported, &mut detection, &events_tx, &metrics);
                             forward(&out_tx, &metrics, exported);
                         }
                     }
@@ -126,6 +163,7 @@ async fn main() -> Result<()> {
                         debug!("active_flows={}", processor.active_flows());
                         for exported in processor.sweep() {
                             info!("flow_export: {:?}", exported);
+                            handle_export(&exported, &mut detection, &events_tx, &metrics);
                             forward(&out_tx, &metrics, exported);
                         }
                     }
@@ -139,6 +177,7 @@ async fn main() -> Result<()> {
             // Flush remaining flows on shutdown (capture tx dropped → rx None)
             for exported in processor.sweep() {
                 info!("flow_export: {:?}", exported);
+                handle_export(&exported, &mut detection, &events_tx, &metrics);
                 forward(&out_tx, &metrics, exported);
             }
 
@@ -199,8 +238,45 @@ async fn main() -> Result<()> {
         Err(_) => error!("ClickHouse writer shutdown timed out"),
     }
 
+    if let Some(handle) = event_writer_handle {
+        match tokio::time::timeout(Duration::from_secs(30), handle).await {
+            Ok(Ok(_)) => info!("Detection event writer stopped."),
+            Ok(Err(e)) => error!("Detection event writer task failed: {}", e),
+            Err(_) => error!("Detection event writer shutdown timed out"),
+        }
+    }
+
     info!("SentinelFlow Sensor stopped.");
     Ok(())
+}
+
+/// Evaluate one exported flow against the detection engine, announce and
+/// forward every produced event. A no-op when detection is disabled.
+fn handle_export(
+    exported: &ExportedFlow,
+    detection: &mut Option<DetectionEngine>,
+    events_tx: &mpsc::Sender<SecurityEvent>,
+    metrics: &SensorMetrics,
+) {
+    let Some(engine) = detection.as_mut() else { return };
+    metrics
+        .detection_windows_active
+        .set(i64::try_from(engine.active_windows()).unwrap_or(i64::MAX));
+    for event in engine.evaluate(exported) {
+        metrics.detection_events_total.with_label_values(&[&event.rule_id]).inc();
+        info!(rule_id = %event.rule_id, severity = %event.severity, "detection event: {}", event.description);
+        forward_event(events_tx, event);
+    }
+}
+
+/// Hand a security event to the event writer without blocking the flow path.
+fn forward_event(events_tx: &mpsc::Sender<SecurityEvent>, event: SecurityEvent) {
+    if let Err(err) = events_tx.try_send(event) {
+        match err {
+            mpsc::error::TrySendError::Full(_) => warn!("events channel full, dropping event"),
+            mpsc::error::TrySendError::Closed(_) => debug!("events channel closed, dropping event"),
+        }
+    }
 }
 
 /// Hand a flow to the writer without blocking packet processing. A full or

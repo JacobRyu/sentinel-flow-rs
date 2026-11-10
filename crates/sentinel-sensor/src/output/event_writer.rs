@@ -120,15 +120,20 @@ mod tests {
     struct MockEventStore {
         batches: Vec<Vec<EventRow>>,
         failures_left: usize,
+        hang: bool,
     }
 
     impl MockEventStore {
         fn returning_ok() -> Self {
-            Self { batches: Vec::new(), failures_left: 0 }
+            Self { batches: Vec::new(), failures_left: 0, hang: false }
         }
 
         fn failing(times: usize) -> Self {
-            Self { batches: Vec::new(), failures_left: times }
+            Self { batches: Vec::new(), failures_left: times, hang: false }
+        }
+
+        fn hanging() -> Self {
+            Self { batches: Vec::new(), failures_left: 0, hang: true }
         }
     }
 
@@ -137,6 +142,9 @@ mod tests {
         type Error = std::io::Error;
 
         async fn write_batch(&mut self, rows: &[EventRow]) -> Result<(), Self::Error> {
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
             if self.failures_left > 0 {
                 self.failures_left -= 1;
                 return Err(std::io::Error::other("injected write failure"));
@@ -153,6 +161,14 @@ mod tests {
     }
 
     async fn spawn_writer(store: MockEventStore, batch_size: usize) -> WriterHandle {
+        spawn_writer_with_timeout(store, batch_size, WRITE_TIMEOUT).await
+    }
+
+    async fn spawn_writer_with_timeout(
+        store: MockEventStore,
+        batch_size: usize,
+        write_timeout: Duration,
+    ) -> WriterHandle {
         let (tx, rx) = mpsc::channel(64);
         let metrics = Arc::new(SensorMetrics::new().unwrap());
         let writer = EventWriter::new(
@@ -160,7 +176,7 @@ mod tests {
             store,
             batch_size,
             Duration::from_millis(50),
-            WRITE_TIMEOUT,
+            write_timeout,
             metrics.clone(),
         );
         let task = tokio::spawn(writer.run());
@@ -228,5 +244,19 @@ mod tests {
         let store = handle.task.await.unwrap();
         assert!(store.batches.is_empty());
         assert_eq!(handle.metrics.detection_failed_writes_total.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn times_out_hung_writes_and_drops_the_batch() {
+        let handle =
+            spawn_writer_with_timeout(MockEventStore::hanging(), 2, Duration::from_millis(50))
+                .await;
+        handle.tx.send(sample_event("SCAN-001", 443)).await.unwrap();
+        handle.tx.send(sample_event("SCAN-001", 22)).await.unwrap();
+        drop(handle.tx);
+        let store = handle.task.await.unwrap();
+        assert!(store.batches.is_empty());
+        assert_eq!(handle.metrics.detection_failed_writes_total.get(), 2);
+        assert_eq!(handle.metrics.detection_events_written.get(), 0);
     }
 }
