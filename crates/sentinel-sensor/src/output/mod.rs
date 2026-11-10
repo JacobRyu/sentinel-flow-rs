@@ -2,6 +2,7 @@
 
 mod batch;
 mod clickhouse;
+mod event_row;
 mod row;
 mod writer;
 

@@ -79,7 +79,7 @@ impl TryFrom<&ExportedFlow> for FlowRow {
 }
 
 /// Map a protocol name to its `Enum8` tag.
-fn protocol_code(protocol: &str) -> i8 {
+pub(crate) fn protocol_code(protocol: &str) -> i8 {
     match protocol {
         "TCP" => 1,
         "UDP" => 2,
@@ -116,7 +116,7 @@ fn parse_ip(ip: &str) -> Result<Ipv6Addr, FlowConvertError> {
 }
 
 /// Ser/de `DateTime<Utc>` as `DateTime64(3)`: i64 milliseconds since epoch.
-mod datetime64_ms {
+pub(crate) mod datetime64_ms {
     use super::*;
 
     pub fn serialize<S: Serializer>(
@@ -136,7 +136,7 @@ mod datetime64_ms {
 }
 
 /// Ser/de `Ipv6Addr` as `IPv6`: 16 raw octets with no length prefix.
-mod ipv6 {
+pub(crate) mod ipv6 {
     use super::*;
 
     pub fn serialize<S: Serializer>(ip: &Ipv6Addr, serializer: S) -> Result<S::Ok, S::Error> {
