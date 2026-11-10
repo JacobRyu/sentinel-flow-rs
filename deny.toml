@@ -8,6 +8,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
   # protobuf v2.x via prometheus - only affects parsing untrusted input, not our use case
   "RUSTSEC-2024-0437",
+  # serde_yaml 0.9 is archived (unmaintained); yanked unsafe-libyaml stays pinned until
+  # the deserializer is migrated to a maintained fork (tracked for a dedicated chore)
+  "RUSTSEC-2024-0449",
 ]
 
 [licenses]
