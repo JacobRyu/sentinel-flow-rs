@@ -1537,7 +1537,7 @@ fn scan001_window_reset_after_expiry() {
     let mut engine = DetectionEngine::new(Vec::new(), vec![window_rule("SCAN-001", "port_scanning", 60, 2)]).unwrap();
     assert_eq!(engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443)).len(), 0);
     expire_window(&mut engine, 61);
-    // 新しい window で再評価 (thr 2, count=1) → 発火しない、window は新しく作り直し
+    // 新しい window で再評価 (threshold 2, count=1) → 発火しない、window は新しく作り直し
     let events = engine.evaluate(&flow("10.0.0.9", 49152, "203.0.113.1", 443));
     assert!(events.is_empty());
     assert_eq!(engine.active_windows(), 1);
@@ -2869,4 +2869,3 @@ git commit -m "feat(sensor): route exported flows through detection engine"
 1. **Spec coverage:** 4ルール（EXT-001/002 → Task 3、SCAN-001/002 → Task 4）、発火ログ（Task 9 `info!`）、security_events 書き込み（Task 7+8+9）、ClickHouse 行変換（Task 6）、`config/detection-rules.yaml` 起動ロード・fail-fast（Task 1/5/9 Step 2）、`detection.enabled: false` は経路非生成（Task 9 分岐）、YAML ロード系の fail-fast 仕様（Task 1 テスト群）、ClickHouse 実接続なしのモック検証（Task 8）。
 2. **Placeholder scan:** TBD/TODO なし。「実装は Task N 同様」のような省略はなし（writer/store はコード全文提示）。
 3. **Type consistency:** `CompiledRule` のフィールド名、`load_rules` の戻り値 `(Vec<CidrRange>, Vec<CompiledRule>)`、`EventWriter::new` 引数順、metrics 名（`…_written_total` / `…failed_writes_total`）は Type map と各 Task で一致。
-
