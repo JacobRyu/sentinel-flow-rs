@@ -392,7 +392,6 @@ fn value_of(addr: IpAddr) -> u128 {
 }
 
 /// RFC1918/4193 + loopback + link-local。EXT-001 のノイズ除去用静的レンジ。
-#[allow(dead_code)] // wired into DetectionEngine in Task 3
 pub(crate) fn private_ranges() -> Vec<CidrRange> {
     [
         "10.0.0.0/8",
@@ -425,7 +424,6 @@ pub(crate) struct RulesDocument {
 }
 
 /// rules ファイルをロードして (allowlist, compiled rules) を返す。
-#[allow(dead_code)] // wired into DetectionEngine in Task 3
 pub(crate) fn load_rules(
     path: &Path,
 ) -> Result<(Vec<CidrRange>, Vec<CompiledRule>), DetectionConfigError> {

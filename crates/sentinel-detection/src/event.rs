@@ -27,7 +27,6 @@ pub struct SecurityEvent {
 }
 
 /// 需要 fields から 1 つの SecurityEvent を発行する（timestamp/uuid はここで採番）。
-#[allow(dead_code)] // wired into DetectionEngine in Task 3
 #[allow(clippy::too_many_arguments)] // API fixed by the Task 2 brief; consumed by engine (Task 3)
 pub(crate) fn build_event(
     rule_id: &str,
@@ -61,7 +60,6 @@ pub(crate) fn build_event(
 }
 
 /// `{key}` プレースホルダを埋める。未知の key はそのまま残す（EXT 系ルールの説明文など）。
-#[allow(dead_code)] // wired into DetectionEngine in Task 3
 pub(crate) fn fill_template(template: &str, values: &[(&str, u64)]) -> String {
     let mut out = template.to_owned();
     for (key, value) in values {
