@@ -1,5 +1,7 @@
 use anyhow::Result;
-use prometheus::{Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
+use prometheus::{
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Registry, TextEncoder,
+};
 
 /// Sensor metrics for Prometheus
 #[allow(dead_code)]
@@ -14,6 +16,10 @@ pub struct SensorMetrics {
     pub flows_dropped: IntCounter,
     pub clickhouse_write_errors: IntCounter,
     pub clickhouse_write_duration: Histogram,
+    pub detection_events_total: IntCounterVec,
+    pub detection_windows_active: IntGauge,
+    pub detection_events_written: IntCounter,
+    pub detection_failed_writes_total: IntCounter,
 }
 
 impl SensorMetrics {
@@ -69,6 +75,29 @@ impl SensorMetrics {
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
         )?;
 
+        let detection_events_total = IntCounterVec::new(
+            prometheus::opts!(
+                "sentinel_detection_events_total",
+                "Total security events emitted by the detection engine"
+            ),
+            &["rule_id"],
+        )?;
+
+        let detection_windows_active = IntGauge::with_opts(prometheus::opts!(
+            "sentinel_detection_windows_active",
+            "Live per-source scan windows in the detection engine"
+        ))?;
+
+        let detection_events_written = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_detection_events_written_total",
+            "Security events successfully written to ClickHouse"
+        ))?;
+
+        let detection_failed_writes_total = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_detection_failed_writes_total",
+            "Security events dropped after exhausting the write retry budget"
+        ))?;
+
         registry.register(Box::new(packets_captured.clone()))?;
         registry.register(Box::new(bytes_captured.clone()))?;
         registry.register(Box::new(packets_dropped.clone()))?;
@@ -78,6 +107,10 @@ impl SensorMetrics {
         registry.register(Box::new(flows_dropped.clone()))?;
         registry.register(Box::new(clickhouse_write_errors.clone()))?;
         registry.register(Box::new(clickhouse_write_duration.clone()))?;
+        registry.register(Box::new(detection_events_total.clone()))?;
+        registry.register(Box::new(detection_windows_active.clone()))?;
+        registry.register(Box::new(detection_events_written.clone()))?;
+        registry.register(Box::new(detection_failed_writes_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -90,6 +123,10 @@ impl SensorMetrics {
             flows_dropped,
             clickhouse_write_errors,
             clickhouse_write_duration,
+            detection_events_total,
+            detection_windows_active,
+            detection_events_written,
+            detection_failed_writes_total,
         })
     }
 
@@ -101,5 +138,22 @@ impl SensorMetrics {
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer)?;
         Ok(String::from_utf8(buffer)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detection_metrics_registered() {
+        let metrics = SensorMetrics::new().unwrap();
+        // Fire the label-bearing counter once so the series materializes.
+        metrics.detection_events_total.with_label_values(&["SCAN-001"]).inc();
+        let exported = metrics.export().unwrap();
+        assert!(exported.contains("sentinel_detection_events_total"));
+        assert!(exported.contains("sentinel_detection_windows_active"));
+        assert!(exported.contains("sentinel_detection_events_written_total"));
+        assert!(exported.contains("sentinel_detection_failed_writes_total"));
     }
 }

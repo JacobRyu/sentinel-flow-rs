@@ -1,9 +1,4 @@
 //! ClickHouse storage for security events `security_events`.
-//!
-//! Not yet wired into the event writer (task 8), so the whole module is
-//! unreachable from `main` today and would trip `-D warnings` on dead code.
-
-#![allow(dead_code)] // removed in task 8 with the writer wiring + mod.rs's unused_imports allowance
 
 use async_trait::async_trait;
 use clickhouse::{Client, sql::Identifier};
