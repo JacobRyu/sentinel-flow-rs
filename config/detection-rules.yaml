@@ -1,0 +1,59 @@
+allowlist:
+  external_ips:
+    - "203.0.113.10"
+    - "198.51.100.0/24"
+
+rules:
+  - id: EXT-001
+    name: unknown_external_destination
+    rule_type: stateless
+    severity: high
+    confidence: 0.8
+    enabled: true
+    parameters:
+      description: "Unknown external destination"
+      tags: ["outbound"]
+      mitigation_suggestions:
+        - "Verify destination legitimacy with the user."
+
+  - id: EXT-002
+    name: unexpected_port
+    rule_type: stateless
+    severity: medium
+    confidence: 0.8
+    enabled: true
+    parameters:
+      service_expected_ports:
+        "8080": [443, 80]
+      description: "Unexpected destination port for local service on source port 8080."
+      tags: ["outbound"]
+      mitigation_suggestions:
+        - "Verify the destination service is expected for this local service."
+
+  - id: SCAN-001
+    name: port_scanning
+    rule_type: window
+    severity: critical
+    confidence: 0.9
+    enabled: true
+    parameters:
+      window_secs: 60
+      threshold: 50
+      description: "Port scanning detected: over {threshold} distinct ports in {window_secs}s."
+      tags: ["scan", "outbound"]
+      mitigation_suggestions:
+        - "Verify source host activity; block or rate-limit if unauthorized."
+
+  - id: SCAN-002
+    name: network_scanning
+    rule_type: window
+    severity: critical
+    confidence: 0.9
+    enabled: true
+    parameters:
+      window_secs: 60
+      threshold: 20
+      description: "Network scanning detected: over {threshold} distinct destinations in {window_secs}s."
+      tags: ["scan", "outbound"]
+      mitigation_suggestions:
+        - "Verify source host activity; block or rate-limit if unauthorized."

@@ -86,11 +86,23 @@ pub struct DetectionConfig {
 
     /// Path to detection rules
     pub rules_path: Option<String>,
+
+    /// 検知イベントの mpsc チャネル容量。EventWriter (Task 8) 導入の flow で使用。
+    #[serde(default = "default_event_channel_capacity")]
+    pub event_channel_capacity: usize,
+}
+
+fn default_event_channel_capacity() -> usize {
+    1000
 }
 
 impl Default for DetectionConfig {
     fn default() -> Self {
-        Self { enabled: true, rules_path: None }
+        Self {
+            enabled: true,
+            rules_path: None,
+            event_channel_capacity: default_event_channel_capacity(),
+        }
     }
 }
 
@@ -152,6 +164,10 @@ impl SensorConfig {
             "output.batch_timeout_ms must be at least 1, got {}",
             self.output.batch_timeout_ms
         );
+        anyhow::ensure!(
+            self.detection.event_channel_capacity >= 1,
+            "detection.event_channel_capacity must be >= 1 (EventWriter sizing)",
+        );
         Ok(())
     }
 
@@ -184,5 +200,12 @@ mod tests {
         let mut config = SensorConfig::default();
         config.output.batch_timeout_ms = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_event_channel_capacity() {
+        let mut config = SensorConfig::default();
+        config.detection.event_channel_capacity = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("event_channel_capacity"),);
     }
 }

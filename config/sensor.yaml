@@ -16,7 +16,8 @@ output:
 
 detection:
   enabled: true
-  rules_path: "config/rules"
+  rules_path: "config/detection-rules.yaml"
+  event_channel_capacity: 1000
 
 metrics:
   enabled: true
