@@ -15,7 +15,7 @@ use super::row::{datetime64_ms, ipv6, protocol_code};
 /// One `security_events` row. Encoding mirrors `FlowRow`: `DateTime64(3)` as
 /// epoch milliseconds, `IPv6` as 16 raw octets (IPv4 as v4-mapped), `Enum8`
 /// protocol/severity as numeric tags.
-#[allow(dead_code)] // wired into the event writer by task 7
+#[allow(dead_code)] // wired into the event writer by task 8
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Row)]
 pub struct EventRow {
     #[serde(with = "clickhouse::serde::uuid")]
@@ -63,7 +63,7 @@ impl From<&SecurityEvent> for EventRow {
 }
 
 /// Map a family-tagged IP onto the schema's IPv6 column (v4-mapped for IPv4).
-#[allow(dead_code)] // only reachable through `EventRow::from` until task 7
+#[allow(dead_code)] // only reachable through `EventRow::from` until task 8
 fn to_ipv6(ip: IpAddr) -> Ipv6Addr {
     match ip {
         IpAddr::V4(v4) => v4.to_ipv6_mapped(),
