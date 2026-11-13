@@ -5,6 +5,7 @@ members = [
     "crates/sentinel-flow",
     "crates/sentinel-detection",
     "crates/sentinel-enrichment",
+    "crates/sentinel-sink",
 ]
 resolver = "2"
 
@@ -38,6 +39,9 @@ prometheus = { version = "0.13", features = ["process"] }
 # Configuration
 config = "0.13"
 clap = { version = "4", features = ["derive"] }
+
+# Messaging
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "libz-static"] }
 
 # Network
 pnet = "0.34"
