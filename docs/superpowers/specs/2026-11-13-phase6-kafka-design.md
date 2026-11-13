@@ -72,7 +72,7 @@ pub struct KafkaFlowStore {
 - 送信: `producer.send_result(FutureRecord { key, payload }, timeout)`。配信完了を待つ（acks=all）。`FutureProducer::send` 相当の完了待ち + `WRITE_TIMEOUT` でタイムアウト
 - 失敗時: `Result<(), KafkaProduceError>` を返す → 既存 FlowWriter のリトライ3回 → 最終失敗で `flows_dropped`（既存挙動踏襲）
 - producer 設定: `acks=all`, `enable.idempotence=true`（順序・重複の乱れを最小化）, `compression.type=lz4`, `bootstrap.servers` は設定から
-- `ClickHouseStore::new` と同様に非 fallible コンストラクタ（producer 生成エラーは初回 write_batch 時にエラーとして返すか、設定検証で検知）
+- `ClickHouseStore::new` と同様に非 fallible コンストラクタ。`KafkaFlowStore::new(&OutputConfig)` は producer 生成に失敗した場合のみ `anyhow::Result` を返す（設定ミスの起動時 fail-fast 用。ネットワーク接続は書き込み時のみ発生するため、コンストラクタ自体は通常成功する）
 
 ### 2. 新規クレート `sentinel-sink`
 
@@ -146,7 +146,7 @@ services:
 ```
 
 - トピック作成コマンド（手順書に含める）: `kafka-topics.sh --create --topic netflow.raw --partitions 4 --retention-ms 604800000`
-- 既存の local-infrastructure.md に kafka セクションを追記するか、別途手順書（`docs/runbooks/kafka-replay.md`）に集約
+- 既存の local-infrastructure.md に kafka セクションを追記するか、別途手順書（`docs/runbooks/kafka-replay.md`）に集約。**決定: `docs/runbooks/kafka-replay.md` に手順書を新規作成する**（local-infrastructure.md は既存の内容を壊さない。ファイル一覧は runbooks を採用）
 
 ### 5. メトリクス
 
@@ -211,5 +211,5 @@ docker compose -f docker-compose.kafka.yml up -d   # 手動 E2E
 | `crates/sentinel-sink/**` | 新規クレート（config/consumer/main/metrics） |
 | `config/sensor.yaml` / `config/sink.yaml` | 編集/新規 |
 | `docker-compose.kafka.yml` | 新規 |
-| `docs/runbooks/kafka-replay.md`（または local-infrastructure.md 追記） | 新規/編集（replay 手順書） |
+| `docs/runbooks/kafka-replay.md` | 新規（replay 手順書。docker-compose 起動〜全件再読取確認まで） |
 | `Cargo.toml`（workspace） | 編集（rdkafka/twox-hash/serde_json 追加、sentinel-sink member 追加） |
