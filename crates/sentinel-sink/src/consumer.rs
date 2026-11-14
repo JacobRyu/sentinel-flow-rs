@@ -1,7 +1,7 @@
 //! Kafka consumption loop for `sentinel-sink`.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rdkafka::config::ClientConfig;
@@ -40,12 +40,12 @@ pub trait KafkaEventSource: Send {
     async fn commit(&mut self) -> Result<(), SourceError>;
 }
 
-/// rdkafka-backed source: delivers payloads and tracks the last offset for
-/// commits. Consumer group semantics: `enable.auto.commit=false`, offsets are
-/// committed manually by [`run`] on a lagging tick.
+/// rdkafka-backed source: delivers payloads and tracks the last offset and its
+/// receive time for commits. Consumer group semantics: `enable.auto.commit=false`,
+/// offsets are committed manually by [`run`] on a lagging, grace-gated tick.
 pub struct KafkaSource {
     consumer: StreamConsumer,
-    last: Option<(String, i32, i64)>,
+    last: Option<(String, i32, i64, Instant)>,
 }
 
 impl KafkaSource {
@@ -66,8 +66,12 @@ impl KafkaEventSource for KafkaSource {
     async fn next_message(&mut self) -> Option<Result<String, SourceError>> {
         match self.consumer.recv().await {
             Ok(message) => {
-                self.last =
-                    Some((message.topic().to_string(), message.partition(), message.offset()));
+                self.last = Some((
+                    message.topic().to_string(),
+                    message.partition(),
+                    message.offset(),
+                    Instant::now(),
+                ));
                 match message.payload_view::<str>() {
                     Some(Ok(payload)) => Some(Ok(payload.to_string())),
                     Some(Err(err)) => Some(Err(SourceError(err.to_string()))),
@@ -79,23 +83,51 @@ impl KafkaEventSource for KafkaSource {
     }
 
     async fn commit(&mut self) -> Result<(), SourceError> {
-        let Some((topic, partition, offset)) = self.last.clone() else {
+        if !should_commit(self.last.clone(), Instant::now()) {
+            return Ok(());
+        }
+        let Some((topic, partition, offset, _)) = self.last.as_ref() else {
             return Ok(());
         };
         let mut tpl = TopicPartitionList::new();
-        tpl.add_partition_offset(&topic, partition, Offset::Offset(offset + 1))
+        tpl.add_partition_offset(topic, *partition, Offset::Offset(*offset + 1))
             .map_err(|err| SourceError(err.to_string()))?;
         self.consumer.commit(&tpl, CommitMode::Async).map_err(|err| SourceError(err.to_string()))
     }
+}
+
+/// Grace period between receiving a message and allowing its offset to be
+/// committed. A row must first traverse the `FlowWriter`: `batch_timeout`
+/// (500ms default), then `WRITE_TIMEOUT` (2s) attempts and backoff. Waiting 8s
+/// lets the normal write path finish before an offset advances, so a crash
+/// redelivers recent messages instead of skipping rows that never reached
+/// disk. A batch stuck in the full retry tail (~9s) can still outlive the
+/// grace; that residual is documented on [`run`].
+const COMMIT_GRACE: Duration = Duration::from_secs(8);
+
+/// `true` when the last delivered message has aged past [`COMMIT_GRACE`] at
+/// `now`. `false` when nothing was delivered yet, or the message is too young
+/// to be provably written.
+fn should_commit(last: Option<(String, i32, i64, Instant)>, now: Instant) -> bool {
+    last.is_some_and(|(_, _, _, received)| now.saturating_duration_since(received) >= COMMIT_GRACE)
 }
 
 /// Runs until the source ends or `shutdown` fires. Sends every parseable row
 /// into the `FlowWriter` channel; poison messages are counted and skipped.
 ///
 /// Commits happen on a **lagging** tick (`commit_interval`, production: 5s),
-/// never per message: a crash redelivers everything since the last commit, so
-/// messages are only ever duplicated, never lost (at-least-once; the commit
-/// position is always behind what `FlowWriter` guarantees on disk).
+/// never per message, and each tick is further gated by [`COMMIT_GRACE`]
+/// (~8s): an offset only advances once the last delivered message is older
+/// than the grace, so in the normal case its batch has already been written to
+/// ClickHouse. Recent messages are therefore redelivered on restart; delivery
+/// is **at-least-once**, where a crash duplicates rows rather than skipping
+/// them. The final commit after the loop uses the same gate, so the tail of a
+/// clean shutdown is redelivered too.
+///
+/// This is not a strict barrier: at the extreme retry tail (four 2s attempts
+/// plus backoff, on top of the batch timeout) a batch can outlive the grace
+/// window, and a permanent ClickHouse outage still drops batches under the
+/// writer's retry-then-drop policy (see the sensor `FlowWriter`).
 pub async fn run(
     mut source: impl KafkaEventSource,
     tx: mpsc::Sender<ExportedFlow>,
@@ -144,7 +176,8 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
     use sentinel_sensor::metrics::SensorMetrics;
@@ -156,11 +189,12 @@ mod tests {
 
     struct MockSource {
         messages: Vec<Result<String, SourceError>>,
-        commits: usize,
+        commits: Arc<AtomicUsize>,
+        last: Option<Instant>,
     }
 
     impl MockSource {
-        fn json_payloads() -> Self {
+        fn json_payloads(commits: Arc<AtomicUsize>) -> Self {
             let exported = sample_exported();
             let row = FlowRow::try_from(&exported).unwrap();
             Self {
@@ -171,7 +205,8 @@ mod tests {
                     Ok("not json".to_string()),
                     Ok(serde_json::to_string(&row).unwrap()),
                 ],
-                commits: 0,
+                commits,
+                last: None,
             }
         }
     }
@@ -202,11 +237,17 @@ mod tests {
             if self.messages.is_empty() {
                 return None;
             }
+            self.last = Some(Instant::now());
             Some(self.messages.remove(0))
         }
 
         async fn commit(&mut self) -> Result<(), SourceError> {
-            self.commits += 1;
+            // Mirror `KafkaSource`'s gate so the loop's tick commits and its
+            // final commit both go through the same condition.
+            let last = self.last.map(|received| ("flows".to_string(), 0, 7, received));
+            if should_commit(last, Instant::now()) {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -227,7 +268,8 @@ mod tests {
 
     #[tokio::test]
     async fn loop_forwards_rows_counts_failures_and_commits() {
-        let source = MockSource::json_payloads();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let source = MockSource::json_payloads(commits.clone());
         let sink_metrics = Arc::new(SinkMetrics::new().unwrap());
         let sensor_metrics = Arc::new(SensorMetrics::new().unwrap());
         let (tx, rx) = mpsc::channel(100);
@@ -255,5 +297,23 @@ mod tests {
         assert_eq!(written, 3);
         assert_eq!(sink_metrics.consumed_total.get(), 3);
         assert_eq!(sink_metrics.failed_messages_total.get(), 2);
+        // Every message in this test is younger than the commit grace, so both
+        // the tick commits and the final commit are skipped: offsets stay put
+        // and the messages are redelivered after a restart (at-least-once).
+        assert_eq!(commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn commit_is_gated_by_grace_on_last_message() {
+        let now = Instant::now();
+        let young = Some(("flows".to_string(), 0, 7, now));
+        let just_under =
+            Some(("flows".to_string(), 0, 7, now - COMMIT_GRACE + Duration::from_millis(1)));
+        let old = Some(("flows".to_string(), 0, 7, now - COMMIT_GRACE));
+
+        assert!(!super::should_commit(young, now));
+        assert!(!super::should_commit(just_under, now));
+        assert!(super::should_commit(old, now));
+        assert!(!super::should_commit(None, now));
     }
 }
