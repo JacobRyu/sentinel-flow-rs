@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::config::CaptureConfig;
 use sentinel_parser::parse_packet;
+use sentinel_sensor::config::CaptureConfig;
 
 /// Packet capture using AF_PACKET via pnet
 pub struct PacketCapture {

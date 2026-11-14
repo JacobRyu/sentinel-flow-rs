@@ -8,7 +8,8 @@ mod event_writer;
 mod row;
 mod writer;
 
-pub(crate) use clickhouse::ClickHouseStore;
-pub(crate) use event_store::ClickHouseEventStore;
-pub(crate) use event_writer::EventWriter;
-pub(crate) use writer::{FlowWriter, WRITE_TIMEOUT};
+pub use clickhouse::{ClickHouseStore, FlowStore};
+pub use event_store::ClickHouseEventStore;
+pub use event_writer::EventWriter;
+pub use row::FlowRow;
+pub use writer::{FlowWriter, WRITE_TIMEOUT};

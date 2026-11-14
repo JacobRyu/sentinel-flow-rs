@@ -9,7 +9,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use tracing::info;
 
-use crate::metrics::SensorMetrics;
+use sentinel_sensor::metrics::SensorMetrics;
 
 /// Serve Prometheus metrics and health probes on `listener` until `shutdown`
 /// resolves.

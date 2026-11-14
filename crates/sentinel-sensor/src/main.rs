@@ -1,8 +1,4 @@
 mod capture;
-mod config;
-mod flow;
-mod metrics;
-mod output;
 mod server;
 
 use anyhow::Result;
@@ -14,12 +10,14 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use capture::PacketCapture;
-use config::SensorConfig;
-use flow::FlowProcessor;
-use metrics::SensorMetrics;
-use output::{ClickHouseEventStore, ClickHouseStore, EventWriter, FlowWriter, WRITE_TIMEOUT};
 use sentinel_detection::{DetectionEngine, SecurityEvent};
 use sentinel_flow::ExportedFlow;
+use sentinel_sensor::config::SensorConfig;
+use sentinel_sensor::flow::FlowProcessor;
+use sentinel_sensor::metrics::SensorMetrics;
+use sentinel_sensor::output::{
+    ClickHouseEventStore, ClickHouseStore, EventWriter, FlowWriter, WRITE_TIMEOUT,
+};
 
 /// Fallback rules file when `detection.rules_path` is not set.
 const DEFAULT_RULES_PATH: &str = "config/detection-rules.yaml";
