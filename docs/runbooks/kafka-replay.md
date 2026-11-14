@@ -118,7 +118,7 @@ Verified: 8 rows before the reset, 16 after the restart, with
 
 `--reset-offsets` refuses to run while the group still has members. After a
 Ctrl-C the group is `Empty` within a few seconds; after a hard kill wait up
-to about a minute (`--describe --state` shows `Empty`) before retrying.
+to about a minute or two (`--describe --state` shows `Empty`) before retrying.
 
 ## Teardown
 
