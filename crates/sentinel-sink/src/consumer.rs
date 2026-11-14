@@ -98,12 +98,12 @@ impl KafkaEventSource for KafkaSource {
 
 /// Grace period between receiving a message and allowing its offset to be
 /// committed. A row must first traverse the `FlowWriter`: `batch_timeout`
-/// (500ms default), then `WRITE_TIMEOUT` (2s) attempts and backoff. Waiting 8s
-/// lets the normal write path finish before an offset advances, so a crash
-/// redelivers recent messages instead of skipping rows that never reached
-/// disk. A batch stuck in the full retry tail (~9s) can still outlive the
-/// grace; that residual is documented on [`run`].
-const COMMIT_GRACE: Duration = Duration::from_secs(8);
+/// (500ms default), then `WRITE_TIMEOUT` (2s) attempts and backoff. The full
+/// retry tail is four 2s attempts plus 0.6s of backoff (~9.1s in total), so
+/// waiting 10s lets even the worst-case write path finish before an offset
+/// advances, and a crash redelivers recent messages instead of skipping rows
+/// that never reached disk.
+const COMMIT_GRACE: Duration = Duration::from_secs(10);
 
 /// `true` when the last delivered message has aged past [`COMMIT_GRACE`] at
 /// `now`. `false` when nothing was delivered yet, or the message is too young
@@ -117,16 +117,14 @@ fn should_commit(last: Option<(String, i32, i64, Instant)>, now: Instant) -> boo
 ///
 /// Commits happen on a **lagging** tick (`commit_interval`, production: 5s),
 /// never per message, and each tick is further gated by [`COMMIT_GRACE`]
-/// (~8s): an offset only advances once the last delivered message is older
+/// (10s): an offset only advances once the last delivered message is older
 /// than the grace, so in the normal case its batch has already been written to
 /// ClickHouse. Recent messages are therefore redelivered on restart; delivery
 /// is **at-least-once**, where a crash duplicates rows rather than skipping
 /// them. The final commit after the loop uses the same gate, so the tail of a
 /// clean shutdown is redelivered too.
 ///
-/// This is not a strict barrier: at the extreme retry tail (four 2s attempts
-/// plus backoff, on top of the batch timeout) a batch can outlive the grace
-/// window, and a permanent ClickHouse outage still drops batches under the
+/// A permanent ClickHouse outage still drops batches under the
 /// writer's retry-then-drop policy (see the sensor `FlowWriter`).
 pub async fn run(
     mut source: impl KafkaEventSource,
