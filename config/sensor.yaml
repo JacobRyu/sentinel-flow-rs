@@ -9,10 +9,15 @@ flow:
   max_flows: 100000
 
 output:
+  mode: direct
   clickhouse_url: "http://localhost:8123"
   clickhouse_database: "sentinel"
   batch_size: 1000
   batch_timeout_ms: 500
+  kafka:
+    brokers:
+      - localhost:9092
+    topic: netflow.raw
 
 detection:
   enabled: true

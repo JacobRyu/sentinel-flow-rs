@@ -40,6 +40,28 @@ impl Default for FlowConfig {
     }
 }
 
+/// Which sink receives exported flow rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    /// Write directly to ClickHouse (default; existing behavior).
+    #[default]
+    Direct,
+    /// Publish each row to the Kafka topic `output.kafka.topic`.
+    Kafka,
+}
+
+/// Kafka producer settings, used only when `output.mode` is `kafka`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KafkaOutputConfig {
+    /// Bootstrap broker list, e.g. ["localhost:9092"].
+    #[serde(default)]
+    pub brokers: Vec<String>,
+    /// Destination topic, e.g. "netflow.raw".
+    #[serde(default)]
+    pub topic: String,
+}
+
 /// Output configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
@@ -62,6 +84,14 @@ pub struct OutputConfig {
 
     /// Batch timeout in milliseconds
     pub batch_timeout_ms: u64,
+
+    /// Output transport selection; `kafka` uses the `kafka` sub-config below.
+    #[serde(default)]
+    pub mode: OutputMode,
+
+    /// Kafka producer settings; only read when `mode` is `kafka`.
+    #[serde(default)]
+    pub kafka: KafkaOutputConfig,
 }
 
 impl Default for OutputConfig {
@@ -74,6 +104,8 @@ impl Default for OutputConfig {
             batch_size: 1000,
             // Kept below the <1s export-to-ClickHouse latency budget.
             batch_timeout_ms: 500,
+            mode: OutputMode::Direct,
+            kafka: KafkaOutputConfig::default(),
         }
     }
 }
@@ -164,6 +196,16 @@ impl SensorConfig {
             "output.batch_timeout_ms must be at least 1, got {}",
             self.output.batch_timeout_ms
         );
+        if self.output.mode == OutputMode::Kafka {
+            anyhow::ensure!(
+                !self.output.kafka.brokers.is_empty(),
+                "output.kafka.brokers must not be empty when output.mode is kafka"
+            );
+            anyhow::ensure!(
+                !self.output.kafka.topic.is_empty(),
+                "output.kafka.topic must not be empty when output.mode is kafka"
+            );
+        }
         anyhow::ensure!(
             self.detection.event_channel_capacity >= 1,
             "detection.event_channel_capacity must be >= 1 (EventWriter sizing)",
@@ -207,5 +249,35 @@ mod tests {
         let mut config = SensorConfig::default();
         config.detection.event_channel_capacity = 0;
         assert!(config.validate().unwrap_err().to_string().contains("event_channel_capacity"),);
+    }
+
+    #[test]
+    fn output_mode_defaults_to_direct() {
+        let config = SensorConfig::default();
+        assert_eq!(config.output.mode, OutputMode::Direct);
+    }
+
+    #[test]
+    fn kafka_mode_requires_brokers_and_topic() {
+        let mut config = SensorConfig::default();
+        config.output.mode = OutputMode::Kafka;
+        assert!(config.validate().is_err());
+
+        config.output.kafka.brokers = vec!["localhost:9092".to_string()];
+        assert!(config.validate().is_err());
+
+        config.output.kafka.topic = "netflow.raw".to_string();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn output_config_parses_kafka_block() {
+        // OutputConfig's scalar fields are required by serde (no per-field
+        // defaults), so the fixture supplies them alongside the new keys.
+        let yaml = "clickhouse_url: http://localhost:8123\nclickhouse_database: sentinel\nbatch_size: 1000\nbatch_timeout_ms: 500\nmode: kafka\nkafka:\n  brokers:\n    - localhost:9092\n  topic: netflow.raw";
+        let output: OutputConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(output.mode, OutputMode::Kafka);
+        assert_eq!(output.kafka.brokers, vec!["localhost:9092".to_string()]);
+        assert_eq!(output.kafka.topic, "netflow.raw");
     }
 }
