@@ -20,6 +20,8 @@ pub struct SensorMetrics {
     pub detection_windows_active: IntGauge,
     pub detection_events_written: IntCounter,
     pub detection_failed_writes_total: IntCounter,
+    pub kafka_produced_total: IntCounter,
+    pub kafka_produce_errors_total: IntCounter,
 }
 
 impl SensorMetrics {
@@ -112,6 +114,17 @@ impl SensorMetrics {
         registry.register(Box::new(detection_events_written.clone()))?;
         registry.register(Box::new(detection_failed_writes_total.clone()))?;
 
+        let kafka_produced_total = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_kafka_produced_total",
+            "Kafka messages successfully produced by the flow output store"
+        ))?;
+        registry.register(Box::new(kafka_produced_total.clone()))?;
+        let kafka_produce_errors_total = IntCounter::with_opts(prometheus::opts!(
+            "sentinel_kafka_produce_errors_total",
+            "Total failed Kafka produce attempts (including retries)"
+        ))?;
+        registry.register(Box::new(kafka_produce_errors_total.clone()))?;
+
         Ok(Self {
             registry,
             packets_captured,
@@ -127,6 +140,8 @@ impl SensorMetrics {
             detection_windows_active,
             detection_events_written,
             detection_failed_writes_total,
+            kafka_produced_total,
+            kafka_produce_errors_total,
         })
     }
 
@@ -155,5 +170,15 @@ mod tests {
         assert!(exported.contains("sentinel_detection_windows_active"));
         assert!(exported.contains("sentinel_detection_events_written_total"));
         assert!(exported.contains("sentinel_detection_failed_writes_total"));
+    }
+
+    #[test]
+    fn kafka_metrics_registered() {
+        let metrics = SensorMetrics::new().unwrap();
+        metrics.kafka_produced_total.inc_by(7);
+        metrics.kafka_produce_errors_total.inc();
+        let export = metrics.export().unwrap();
+        assert!(export.contains("sentinel_kafka_produced_total 7"));
+        assert!(export.contains("sentinel_kafka_produce_errors_total 1"));
     }
 }
