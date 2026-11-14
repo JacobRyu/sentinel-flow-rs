@@ -12,12 +12,14 @@ use tracing::{debug, error, info, warn};
 use capture::PacketCapture;
 use sentinel_detection::{DetectionEngine, SecurityEvent};
 use sentinel_flow::ExportedFlow;
-use sentinel_sensor::config::SensorConfig;
+use sentinel_sensor::config::{OutputConfig, OutputMode, SensorConfig};
 use sentinel_sensor::flow::FlowProcessor;
 use sentinel_sensor::metrics::SensorMetrics;
 use sentinel_sensor::output::{
-    ClickHouseEventStore, ClickHouseStore, EventWriter, FlowWriter, WRITE_TIMEOUT,
+    ClickHouseEventStore, ClickHouseStore, EventWriter, FlowStore, FlowWriter, KafkaFlowStore,
+    WRITE_TIMEOUT,
 };
+use tokio::task::JoinHandle;
 
 /// Fallback rules file when `detection.rules_path` is not set.
 const DEFAULT_RULES_PATH: &str = "config/detection-rules.yaml";
@@ -79,17 +81,23 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    // Flow output channel: processor produces, writer batches into ClickHouse.
+    // Flow output channel: processor produces, writer batches into the
+    // configured sink (ClickHouse directly, or Kafka when mode is kafka).
     let (out_tx, out_rx) = mpsc::channel(10000);
-    let writer = FlowWriter::new(
-        out_rx,
-        ClickHouseStore::new(&config.output),
-        config.output.batch_size,
-        Duration::from_millis(config.output.batch_timeout_ms),
-        WRITE_TIMEOUT,
-        metrics.clone(),
-    );
-    let writer_handle = tokio::spawn(writer.run());
+    let writer_handle = match config.output.mode {
+        OutputMode::Direct => spawn_flow_writer(
+            out_rx,
+            ClickHouseStore::new(&config.output),
+            &config.output,
+            metrics.clone(),
+        ),
+        OutputMode::Kafka => spawn_flow_writer(
+            out_rx,
+            KafkaFlowStore::new(&config.output, metrics.clone())?,
+            &config.output,
+            metrics.clone(),
+        ),
+    };
 
     // Detection: loaded before the processor starts so rule defects fail fast at startup.
     let detection = if config.detection.enabled {
@@ -275,6 +283,30 @@ fn forward_event(events_tx: &mpsc::Sender<SecurityEvent>, event: SecurityEvent) 
             mpsc::error::TrySendError::Closed(_) => debug!("events channel closed, dropping event"),
         }
     }
+}
+
+/// Spawn the flow writer for whichever store the configured mode selected.
+///
+/// The store is the writer's return value, and it is unused by the shutdown
+/// path; awaiting inside the task keeps both match arms the same type
+/// (`JoinHandle<()>`) regardless of store.
+fn spawn_flow_writer<S: FlowStore + 'static>(
+    out_rx: mpsc::Receiver<ExportedFlow>,
+    store: S,
+    output: &OutputConfig,
+    metrics: Arc<SensorMetrics>,
+) -> JoinHandle<()> {
+    let writer = FlowWriter::new(
+        out_rx,
+        store,
+        output.batch_size,
+        Duration::from_millis(output.batch_timeout_ms),
+        WRITE_TIMEOUT,
+        metrics,
+    );
+    tokio::spawn(async move {
+        writer.run().await;
+    })
 }
 
 /// Hand a flow to the writer without blocking packet processing. A full or
