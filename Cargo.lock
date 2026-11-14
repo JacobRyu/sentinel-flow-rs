@@ -1419,7 +1419,20 @@ dependencies = [
 name = "sentinel-sink"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "prometheus",
+ "rdkafka",
+ "sentinel-flow",
+ "sentinel-sensor",
+ "serde",
+ "serde_json",
+ "serde_yaml",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+# sentinel-sink configuration: consumes netflow.raw and writes network_flows.
+kafka:
+  brokers:
+    - localhost:9092
+  topic: netflow.raw
+  group_id: clickhouse-sinker
+
+clickhouse:
+  url: http://localhost:8123
+  database: sentinel
+  batch_size: 1000
+  batch_timeout_ms: 500
+
+metrics:
+  enabled: true
+  port: 9091
