@@ -13,3 +13,6 @@ chrono = { workspace = true }
 xxhash-rust = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

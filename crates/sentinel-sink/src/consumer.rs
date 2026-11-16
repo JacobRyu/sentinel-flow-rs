@@ -280,6 +280,16 @@ mod tests {
             duration_ms: 1333,
             tcp_flags: vec!["SYN".to_string(), "ACK".to_string()],
             sensor_node: "node-1".to_string(),
+            source_namespace: None,
+            source_pod: None,
+            source_deployment: None,
+            source_service: None,
+            source_app: None,
+            destination_namespace: None,
+            destination_pod: None,
+            destination_deployment: None,
+            destination_service: None,
+            destination_app: None,
         }
     }
 
