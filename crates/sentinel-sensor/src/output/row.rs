@@ -37,6 +37,18 @@ pub struct FlowRow {
     /// Observed TCP flag bits: FIN=1, SYN=2, RST=4, PSH=8, ACK=16, URG=32.
     pub tcp_flags_seen: Vec<u8>,
     pub sensor_node: String,
+    /// Kubernetes metadata captured at export time; `None` when the enricher
+    /// is disabled or no Kubernetes object matched the IP.
+    pub source_namespace: Option<String>,
+    pub source_pod: Option<String>,
+    pub source_deployment: Option<String>,
+    pub source_service: Option<String>,
+    pub source_app: Option<String>,
+    pub destination_namespace: Option<String>,
+    pub destination_pod: Option<String>,
+    pub destination_deployment: Option<String>,
+    pub destination_service: Option<String>,
+    pub destination_app: Option<String>,
 }
 
 /// Reason a flow could not be converted into a [`FlowRow`].
@@ -74,6 +86,16 @@ impl TryFrom<&ExportedFlow> for FlowRow {
                 .map_err(|_| FlowConvertError::Duration(flow.duration_ms))?,
             tcp_flags_seen: flow.tcp_flags.iter().filter_map(|name| flag_bit(name)).collect(),
             sensor_node: flow.sensor_node.clone(),
+            source_namespace: flow.source_namespace.clone(),
+            source_pod: flow.source_pod.clone(),
+            source_deployment: flow.source_deployment.clone(),
+            source_service: flow.source_service.clone(),
+            source_app: flow.source_app.clone(),
+            destination_namespace: flow.destination_namespace.clone(),
+            destination_pod: flow.destination_pod.clone(),
+            destination_deployment: flow.destination_deployment.clone(),
+            destination_service: flow.destination_service.clone(),
+            destination_app: flow.destination_app.clone(),
         })
     }
 }
@@ -203,6 +225,33 @@ mod tests {
         assert_eq!(row.duration_ms, 1333);
         assert_eq!(row.tcp_flags_seen, vec![0x02, 0x10]);
         assert_eq!(row.sensor_node, "node-1");
+    }
+
+    #[test]
+    fn metadata_columns_roundtrip_through_row() {
+        let mut flow = sample_flow("0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01");
+        flow.source_namespace = Some("prod".to_string());
+        flow.source_pod = Some("web-7f9c".to_string());
+        flow.source_deployment = Some("web".to_string());
+        flow.source_service = Some("web-svc".to_string());
+        flow.source_app = Some("web".to_string());
+        flow.destination_app = Some("billing".to_string());
+
+        let row = FlowRow::try_from(&flow).unwrap();
+        assert_eq!(row.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(row.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(row.source_deployment.as_deref(), Some("web"));
+        assert_eq!(row.source_service.as_deref(), Some("web-svc"));
+        assert_eq!(row.source_app.as_deref(), Some("web"));
+        assert_eq!(row.destination_app.as_deref(), Some("billing"));
+        assert_eq!(row.destination_namespace, None);
+        assert_eq!(row.destination_pod, None);
+
+        // Kafka JSON path: the full row (metadata included) must survive
+        // serde_json round-trip byte-for-byte.
+        let payload = serde_json::to_string(&row).unwrap();
+        let decoded: FlowRow = serde_json::from_str(&payload).unwrap();
+        assert_eq!(decoded, row);
     }
 
     #[test]

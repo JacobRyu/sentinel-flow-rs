@@ -28,10 +28,12 @@ pub trait FlowStore: Send {
 
 /// Idempotent DDL for the `network_flows` table.
 ///
-/// Matches the schema in `docs/architecture.md` with two deliberate
-/// differences: `MergeTree()` instead of `ReplicatedMergeTree()` (single-node
-/// deployment; switch on HA with a Keeper-backed replica path) and no
-/// Kubernetes metadata columns yet (added by `ALTER TABLE` in Phase 7).
+/// Matches the schema in `docs/architecture.md` with one deliberate
+/// difference: `MergeTree()` instead of `ReplicatedMergeTree()` (single-node
+/// deployment; switch on HA with a Keeper-backed replica path). The Kubernetes
+/// metadata columns ship in the fresh-table DDL; the idempotent `ALTER TABLE`
+/// loop in [`ClickHouseStore::ensure_schema`] migrates tables created by
+/// earlier versions in place.
 fn create_table_sql() -> String {
     format!(
         r#"CREATE TABLE IF NOT EXISTS {TABLE}
@@ -50,7 +52,17 @@ fn create_table_sql() -> String {
     bytes_reverse UInt64,
     duration_ms UInt32,
     tcp_flags_seen Array(UInt8),
-    sensor_node LowCardinality(String)
+    sensor_node LowCardinality(String),
+    source_namespace Nullable(LowCardinality(String)),
+    source_pod Nullable(LowCardinality(String)),
+    source_deployment Nullable(LowCardinality(String)),
+    source_service Nullable(LowCardinality(String)),
+    source_app Nullable(LowCardinality(String)),
+    destination_namespace Nullable(LowCardinality(String)),
+    destination_pod Nullable(LowCardinality(String)),
+    destination_deployment Nullable(LowCardinality(String)),
+    destination_service Nullable(LowCardinality(String)),
+    destination_app Nullable(LowCardinality(String))
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp_start)
@@ -97,6 +109,26 @@ impl ClickHouseStore {
             .execute()
             .await?;
         self.client.query(&create_table_sql()).execute().await?;
+        for column in [
+            "source_namespace",
+            "source_pod",
+            "source_deployment",
+            "source_service",
+            "source_app",
+            "destination_namespace",
+            "destination_pod",
+            "destination_deployment",
+            "destination_service",
+            "destination_app",
+        ] {
+            self.client
+                .query(&format!(
+                    "ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {column} \
+                     Nullable(LowCardinality(String))"
+                ))
+                .execute()
+                .await?;
+        }
         self.schema_ready = true;
         Ok(())
     }
@@ -379,6 +411,40 @@ mod tests {
 
         drop(tx);
         writer_task.await.expect("writer task");
+    }
+
+    #[tokio::test]
+    async fn metadata_columns_roundtrip_through_clickhouse() {
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+        if !clickhouse_available(&url).await {
+            eprintln!("skipping ClickHouse integration test: no server at {url}");
+            return;
+        }
+
+        let config = test_config(&url, "sentinel_it_metadata");
+        let mut store = ClickHouseStore::new(&config);
+        reset_test_table(&mut store, "sentinel_it_metadata").await;
+
+        let mut flow = sample_flow("0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01");
+        flow.source_namespace = Some("prod".to_string());
+        flow.source_pod = Some("web-7f9c".to_string());
+        flow.source_deployment = Some("web".to_string());
+        flow.source_app = Some("web".to_string());
+
+        let row = FlowRow::try_from(&flow).unwrap();
+        store.write_batch(std::slice::from_ref(&row)).await.expect("write batch");
+
+        let fetched: FlowRow = store
+            .client
+            .query("SELECT ?fields FROM network_flows WHERE flow_id = toUUID(?)")
+            .bind(row.flow_id.to_string())
+            .fetch_one()
+            .await
+            .expect("select row");
+        assert_eq!(fetched, row);
+        assert_eq!(fetched.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(fetched.destination_namespace, None);
     }
 
     #[test]
