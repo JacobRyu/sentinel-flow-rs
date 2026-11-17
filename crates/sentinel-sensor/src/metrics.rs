@@ -22,6 +22,7 @@ pub struct SensorMetrics {
     pub detection_failed_writes_total: IntCounter,
     pub kafka_produced_total: IntCounter,
     pub kafka_produce_errors_total: IntCounter,
+    pub kubernetes_cache_size: IntGauge,
 }
 
 impl SensorMetrics {
@@ -125,6 +126,12 @@ impl SensorMetrics {
         ))?;
         registry.register(Box::new(kafka_produce_errors_total.clone()))?;
 
+        let kubernetes_cache_size = IntGauge::with_opts(prometheus::opts!(
+            "sentinel_kubernetes_cache_size",
+            "Pod IPs currently tracked by the Kubernetes enrichment cache"
+        ))?;
+        registry.register(Box::new(kubernetes_cache_size.clone()))?;
+
         Ok(Self {
             registry,
             packets_captured,
@@ -142,6 +149,7 @@ impl SensorMetrics {
             detection_failed_writes_total,
             kafka_produced_total,
             kafka_produce_errors_total,
+            kubernetes_cache_size,
         })
     }
 
@@ -180,5 +188,12 @@ mod tests {
         let export = metrics.export().unwrap();
         assert!(export.contains("sentinel_kafka_produced_total 7"));
         assert!(export.contains("sentinel_kafka_produce_errors_total 1"));
+    }
+
+    #[test]
+    fn kubernetes_cache_size_registered() {
+        let metrics = SensorMetrics::new().unwrap();
+        let export = metrics.export().unwrap();
+        assert!(export.contains("sentinel_kubernetes_cache_size 0"));
     }
 }
