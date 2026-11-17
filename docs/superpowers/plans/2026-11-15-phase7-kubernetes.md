@@ -971,4 +971,720 @@ git add Cargo.lock Cargo.toml crates/sentinel-enrichment/ crates/sentinel-sensor
 git commit -m "feat(enrichment): kube informers feed the metadata cache"
 ```
 
-<!-- PLAN-CONTINUES -->
+### Task 4: FlowRow + ClickHouse metadata columns (DDL + idempotent ALTERs)
+
+**Files:**
+- Modify: `crates/sentinel-sensor/src/output/row.rs`
+- Modify: `crates/sentinel-sensor/src/output/clickhouse.rs`
+
+**Interfaces:**
+- Consumes: `ExportedFlow` 10 metadata fields (Task 1, frozen order after `sensor_node`: source_namespace, source_pod, source_deployment, source_service, source_app, destination_namespace, destination_pod, destination_deployment, destination_service, destination_app); `FlowRow` (Serialize/Deserialize for Kafka JSON + `Row` for ClickHouse binary); `create_table_sql()` / `ensure_schema` (clickhouse.rs).
+- Produces (for Task 6): `FlowRow` gains 10 `pub Option<String>` fields AT THE END, in the SAME frozen order as `ExportedFlow` (RowBinary column order = struct field order; Kafka JSON keeps byte-exact round-trip because `Option<String>` serializes as `null` when `None`). DDL appends 10 `Nullable(LowCardinality(String))` columns in the same order; `ensure_schema` runs 10 idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements after table creation so an existing `network_flows` table migrates in place (spec D2).
+
+- [ ] **Step 1: Write the failing row test**
+
+In `crates/sentinel-sensor/src/output/row.rs`, inside the existing `#[cfg(test)] mod tests`, add:
+
+```rust
+    #[test]
+    fn metadata_columns_roundtrip_through_row() {
+        let mut flow = sample_flow("0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01");
+        flow.source_namespace = Some("prod".to_string());
+        flow.source_pod = Some("web-7f9c".to_string());
+        flow.source_deployment = Some("web".to_string());
+        flow.source_service = Some("web-svc".to_string());
+        flow.source_app = Some("web".to_string());
+        flow.destination_app = Some("billing".to_string());
+
+        let row = FlowRow::try_from(&flow).unwrap();
+        assert_eq!(row.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(row.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(row.source_deployment.as_deref(), Some("web"));
+        assert_eq!(row.source_service.as_deref(), Some("web-svc"));
+        assert_eq!(row.source_app.as_deref(), Some("web"));
+        assert_eq!(row.destination_app.as_deref(), Some("billing"));
+        assert_eq!(row.destination_namespace, None);
+        assert_eq!(row.destination_pod, None);
+
+        // Kafka JSON path: the full row (metadata included) must survive
+        // serde_json round-trip byte-for-byte.
+        let payload = serde_json::to_string(&row).unwrap();
+        let decoded: FlowRow = serde_json::from_str(&payload).unwrap();
+        assert_eq!(decoded, row);
+    }
+```
+
+(`serde_json` is already a dependency of the sensor crate; no manifest change in this task.)
+
+- [ ] **Step 2: Run tests to verify the new test fails**
+
+Run: `cargo nextest run -p sentinel-sensor row`
+Expected: FAIL — no fields `source_namespace` etc. on `FlowRow` (compile error counts as red).
+
+- [ ] **Step 3: Add the 10 fields and the TryFrom copies**
+
+In `crates/sentinel-sensor/src/output/row.rs`, append to the `FlowRow` struct AFTER `pub sensor_node: String,` (frozen order, mirroring `ExportedFlow` exactly):
+
+```rust
+    /// Kubernetes metadata captured at export time; `None` when the enricher
+    /// is disabled or no Kubernetes object matched the IP.
+    pub source_namespace: Option<String>,
+    pub source_pod: Option<String>,
+    pub source_deployment: Option<String>,
+    pub source_service: Option<String>,
+    pub source_app: Option<String>,
+    pub destination_namespace: Option<String>,
+    pub destination_pod: Option<String>,
+    pub destination_deployment: Option<String>,
+    pub destination_service: Option<String>,
+    pub destination_app: Option<String>,
+```
+
+In `impl TryFrom<&ExportedFlow> for FlowRow`, after the `sensor_node` assignment, add the copies:
+
+```rust
+            source_namespace: flow.source_namespace.clone(),
+            source_pod: flow.source_pod.clone(),
+            source_deployment: flow.source_deployment.clone(),
+            source_service: flow.source_service.clone(),
+            source_app: flow.source_app.clone(),
+            destination_namespace: flow.destination_namespace.clone(),
+            destination_pod: flow.destination_pod.clone(),
+            destination_deployment: flow.destination_deployment.clone(),
+            destination_service: flow.destination_service.clone(),
+            destination_app: flow.destination_app.clone(),
+```
+
+Mechanical check (Task 1 reviewer handoff: mirror the frozen order): compare the new field list line-by-line against the field list after `sensor_node` in `crates/sentinel-flow/src/export.rs` — the orders must match exactly; report any mismatch instead of "fixing" one side silently.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo nextest run -p sentinel-sensor`
+Expected: all row tests pass, including `metadata_columns_roundtrip_through_row`. (No workspace-level gate yet — the DDL half is next.)
+
+- [ ] **Step 5: Extend the DDL and make ensure_schema migrate in place**
+
+In `crates/sentinel-sensor/src/output/clickhouse.rs`:
+
+a) In `create_table_sql()`, add a trailing comma after the `sensor_node LowCardinality(String)` column line and append the 10 columns (same frozen order):
+
+```sql
+    source_namespace Nullable(LowCardinality(String)),
+    source_pod Nullable(LowCardinality(String)),
+    source_deployment Nullable(LowCardinality(String)),
+    source_service Nullable(LowCardinality(String)),
+    source_app Nullable(LowCardinality(String)),
+    destination_namespace Nullable(LowCardinality(String)),
+    destination_pod Nullable(LowCardinality(String)),
+    destination_deployment Nullable(LowCardinality(String)),
+    destination_service Nullable(LowCardinality(String)),
+    destination_app Nullable(LowCardinality(String))
+```
+
+Update the doc comment that says "no Kubernetes metadata columns yet" — the fresh-table DDL now carries them; ALTERs below still cover tables created by earlier versions.
+
+b) In `ensure_schema`, immediately after the `create_table_sql()` execution, add the idempotent migration loop:
+
+```rust
+        for column in [
+            "source_namespace",
+            "source_pod",
+            "source_deployment",
+            "source_service",
+            "source_app",
+            "destination_namespace",
+            "destination_pod",
+            "destination_deployment",
+            "destination_service",
+            "destination_app",
+        ] {
+            self.client
+                .query(&format!(
+                    "ALTER TABLE {TABLE} ADD COLUMN IF NOT EXISTS {column} \
+                     Nullable(LowCardinality(String))"
+                ))
+                .execute()
+                .await?;
+        }
+```
+
+(`TABLE` is the module-private constant; the column names come from a fixed list, so inlining is safe — no `Identifier` binding needed.)
+
+- [ ] **Step 6: Write the ClickHouse IT test**
+
+In `crates/sentinel-sensor/src/output/clickhouse.rs`, inside the existing `#[cfg(test)] mod tests`, add (mirroring the probe-skip style of `schema_and_writes_roundtrip`):
+
+```rust
+    #[tokio::test]
+    async fn metadata_columns_roundtrip_through_clickhouse() {
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+        if !clickhouse_available(&url).await {
+            eprintln!("skipping ClickHouse integration test: no server at {url}");
+            return;
+        }
+
+        let config = test_config(&url, "sentinel_it_metadata");
+        let mut store = ClickHouseStore::new(&config);
+        reset_test_table(&mut store, "sentinel_it_metadata").await;
+
+        let mut flow = sample_flow("0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01");
+        flow.source_namespace = Some("prod".to_string());
+        flow.source_pod = Some("web-7f9c".to_string());
+        flow.source_deployment = Some("web".to_string());
+        flow.source_app = Some("web".to_string());
+
+        let row = FlowRow::try_from(&flow).unwrap();
+        store.write_batch(std::slice::from_ref(&row)).await.expect("write batch");
+
+        let fetched: FlowRow = store
+            .client
+            .query("SELECT ?fields FROM network_flows WHERE flow_id = toUUID(?)")
+            .bind(row.flow_id.to_string())
+            .fetch_one()
+            .await
+            .expect("select row");
+        assert_eq!(fetched, row);
+        assert_eq!(fetched.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(fetched.destination_namespace, None);
+    }
+```
+
+- [ ] **Step 7: Run all gates**
+
+Run: `cargo nextest run --workspace && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check`
+Expected: 152 passed (150 + 2 new; the IT test self-skips without a server); clippy/fmt clean.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/sentinel-sensor/src/output/row.rs crates/sentinel-sensor/src/output/clickhouse.rs
+git commit -m "feat(sensor): kubernetes metadata columns on network_flows"
+```
+
+### Task 5: Sensor config + export-site enrichment wiring
+
+**Files:**
+- Modify: `crates/sentinel-sensor/src/config.rs`
+- Modify: `crates/sentinel-sensor/Cargo.toml`
+- Modify: `crates/sentinel-sensor/src/main.rs`
+- Modify: `config/sensor.yaml`
+
+**Interfaces:**
+- Consumes: `KubernetesEnricher::{new, enrich(&self, ip: &IpAddr, now: Instant) -> Option<EndpointMetadata>}` (Task 2); `KubernetesRuntime::start(client: kube::Client, enricher: Arc<KubernetesEnricher>, metrics: Arc<SensorMetrics>) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>>` (Task 3); `SensorConfig` / `validate()`; `EndpointMetadata { namespace, pod, deployment, service, app }` all `Option<String>`.
+- Produces (for Task 7 runbook): `SensorConfig.kubernetes.enabled` (default `false`); sensor main wires enrichment at the 3 export sites (packet arm, sweep arm, final sweep) BEFORE `handle_export`, so detection events and the ClickHouse/Kafka sink both see enriched flows (spec D9).
+- Stage allowlist ruling (ledger): `crates/sentinel-sink/src/adapter.rs` is EXCLUDED here — metadata copy is Task 6-exclusive.
+
+- [ ] **Step 1: Write the failing config tests**
+
+Append to the existing `#[cfg(test)] mod tests` in `crates/sentinel-sensor/src/config.rs`:
+
+```rust
+    #[test]
+    fn kubernetes_defaults_to_disabled() {
+        let config = SensorConfig::default();
+        assert!(!config.kubernetes.enabled);
+    }
+
+    #[test]
+    fn kubernetes_enabled_parses() {
+        let kubernetes: KubernetesConfig = serde_yaml::from_str("enabled: true").unwrap();
+        assert!(kubernetes.enabled);
+        let kubernetes: KubernetesConfig = serde_yaml::from_str("").unwrap();
+        assert!(!kubernetes.enabled);
+    }
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `cargo nextest run -p sentinel-sensor config`
+Expected: FAIL — no field `kubernetes` / type `KubernetesConfig` (compile error counts as red).
+
+- [ ] **Step 3: Implement KubernetesConfig**
+
+In `crates/sentinel-sensor/src/config.rs`, add before `SensorConfig`:
+
+```rust
+/// Kubernetes enrichment settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KubernetesConfig {
+    /// Connect to the cluster and enrich flows at export time (default: off).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for KubernetesConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+```
+
+Add the field to `SensorConfig` (with `#[serde(default)]` so existing `config/sensor.yaml` files without the key keep parsing):
+
+```rust
+    /// Kubernetes enrichment settings
+    #[serde(default)]
+    pub kubernetes: KubernetesConfig,
+```
+
+No `validate()` change (spec D3: disabled by default; connection failures are fail-fast in main, not config validation).
+
+- [ ] **Step 4: Add the dependencies**
+
+In `crates/sentinel-sensor/Cargo.toml` `[dependencies]`, add:
+
+```toml
+sentinel-enrichment = { path = "../sentinel-enrichment" }
+kube = { workspace = true }
+```
+
+(`kube` is needed only for `kube::Client::try_default().await` — the client-construction site frozen by Task 3's `KubernetesRuntime::start(client, ...)` interface. If the compiler shows kube is reachable through `sentinel-enrichment` re-exports instead, use that and drop the direct dep; report which you did.)
+
+- [ ] **Step 5: Wire the enricher into main.rs**
+
+In `crates/sentinel-sensor/src/main.rs`:
+
+a) Extend imports:
+
+```rust
+use sentinel_enrichment::informer::KubernetesRuntime;
+use sentinel_enrichment::kubernetes::KubernetesEnricher;
+use sentinel_flow::ExportedFlow;
+use std::net::IpAddr;
+```
+
+(`KubernetesEnricher` is also reachable as `sentinel_enrichment::KubernetesEnricher` via the lib re-export — either path is fine; keep one and report.)
+
+b) After the detection/event-writer bootstrap and BEFORE the processor task, add:
+
+```rust
+    // Kubernetes enrichment: disabled by default. When enabled, connect
+    // fail-fast (same contract as detection rules) and start the watchers.
+    let mut enricher: Option<Arc<KubernetesEnricher>> = None;
+    let mut kubernetes_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if config.kubernetes.enabled {
+        let client = kube::Client::try_default().await?;
+        let shared = Arc::new(KubernetesEnricher::new());
+        let handles = KubernetesRuntime::start(client, shared.clone(), metrics.clone())?;
+        kubernetes_tasks.extend(handles);
+        enricher = Some(shared);
+    }
+```
+
+c) Add the helper (near the other free helper fns):
+
+```rust
+/// Enrich one exported flow in place. No-op when the enricher is disabled
+/// (spec D3) or when neither IP parses (should not happen; malformed data
+/// must not kill the capture loop).
+fn enrich_ip(enricher: &Option<Arc<KubernetesEnricher>>, exported: &mut ExportedFlow) {
+    let Some(enricher) = enricher else { return };
+    let (Ok(source), Ok(destination)) = (
+        exported.source_ip.parse::<IpAddr>(),
+        exported.destination_ip.parse::<IpAddr>(),
+    ) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if let Some(metadata) = enricher.enrich(&source, now) {
+        exported.source_namespace = metadata.namespace;
+        exported.source_pod = metadata.pod;
+        exported.source_deployment = metadata.deployment;
+        exported.source_service = metadata.service;
+        exported.source_app = metadata.app;
+    }
+    if let Some(metadata) = enricher.enrich(&destination, now) {
+        exported.destination_namespace = metadata.namespace;
+        exported.destination_pod = metadata.pod;
+        exported.destination_deployment = metadata.deployment;
+        exported.destination_service = metadata.service;
+        exported.destination_app = metadata.app;
+    }
+}
+```
+
+d) Call `enrich_ip(&enricher, &mut exported);` at all 3 export sites, immediately after the flow is obtained and BEFORE `handle_export`:
+
+- packet arm: change `if let Some(exported) = processor.on_packet(&packet)` to `if let Some(mut exported) = ...` and insert the call first.
+- sweep arm: the `for exported in processor.sweep()` loop becomes `for mut exported in ...` with the call first.
+- final sweep loop after shutdown: same pattern.
+
+`handle_export`, `forward_event`, `forward`, and the shutdown sequence stay untouched — except: at shutdown, abort the watcher tasks (`for handle in kubernetes_tasks { handle.abort(); }`) placed before the processor shutdown await so watchers do not outlive the loop.
+
+- [ ] **Step 6: Write the wiring test**
+
+Append to `crates/sentinel-sensor/src/main.rs` a new test module (main.rs has none today — add it at the bottom):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_enrichment::kubernetes::{PodSnapshot, normalize_ip};
+
+    fn sample_exported() -> ExportedFlow {
+        ExportedFlow {
+            flow_id: "0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01".to_string(),
+            timestamp_start: "2026-09-25T10:00:00.123+00:00".to_string(),
+            timestamp_end: "2026-09-25T10:00:01.456+00:00".to_string(),
+            source_ip: "10.0.0.1".to_string(),
+            destination_ip: "2001:db8::1".to_string(),
+            source_port: 44321,
+            destination_port: 443,
+            protocol: "TCP".to_string(),
+            packets_forward: 10,
+            packets_reverse: 20,
+            bytes_forward: 1000,
+            bytes_reverse: 2000,
+            duration_ms: 1333,
+            tcp_flags: vec!["SYN".to_string(), "ACK".to_string()],
+            sensor_node: "node-1".to_string(),
+            source_namespace: None,
+            source_pod: None,
+            source_deployment: None,
+            source_service: None,
+            source_app: None,
+            destination_namespace: None,
+            destination_pod: None,
+            destination_deployment: None,
+            destination_service: None,
+            destination_app: None,
+        }
+    }
+
+    #[test]
+    fn enrich_ip_fills_metadata_when_enabled_and_noops_when_disabled() {
+        // Disabled path (spec D3): fields stay None.
+        let mut flow = sample_exported();
+        enrich_ip(&None, &mut flow);
+        assert_eq!(flow.source_namespace, None);
+        assert_eq!(flow.source_pod, None);
+
+        // Enabled path: a pod cached for 10.0.0.1 fills the source side only.
+        let enricher = Arc::new(KubernetesEnricher::new());
+        enricher.apply_pod(
+            normalize_ip(&IpAddr::from([10, 0, 0, 1])),
+            PodSnapshot {
+                name: "web-7f9c".to_string(),
+                namespace: "prod".to_string(),
+                owner_uid: None,
+                labels: Default::default(),
+                node: "node-a".to_string(),
+                updated_at: std::time::Instant::now(),
+            },
+        );
+        let mut flow = sample_exported();
+        enrich_ip(&Some(enricher), &mut flow);
+        assert_eq!(flow.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(flow.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(flow.source_deployment, None);
+        assert_eq!(flow.destination_pod, None);
+    }
+}
+```
+
+NOTE: `apply_pod` / `normalize_ip` signatures were frozen by Task 2 — if the actual signatures differ (e.g. `apply_pod` takes `&IpAddr`, or `normalize_ip` is not pub), adapt the test mechanically to Task 2's real API and report the exact adjustment. If `PodSnapshot` fields are not constructible as written (private fields), assert only through `enrich`'s observable behavior the Task 2 tests already prove, and restructure the test to that shape; report.
+
+- [ ] **Step 7: Extend config/sensor.yaml**
+
+Append to the end of `config/sensor.yaml`:
+
+```yaml
+kubernetes:
+  enabled: false
+```
+
+- [ ] **Step 8: Run all gates**
+
+Run: `cargo nextest run --workspace && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check`
+Expected: 155 passed (152 + 3 new); clippy/fmt clean; no dead-code warnings (`KubernetesRuntime::start` is now called; `enrich_ip` is called at 3 sites).
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add crates/sentinel-sensor/src/config.rs crates/sentinel-sensor/src/main.rs crates/sentinel-sensor/Cargo.toml config/sensor.yaml Cargo.lock
+git commit -m "feat(sensor): enrich flows with kubernetes metadata at export"
+```
+
+### Task 6: Sink adapter carries metadata (completes the lossless round-trip)
+
+**Files:**
+- Modify: `crates/sentinel-sink/src/adapter.rs`
+
+**Interfaces:**
+- Consumes: `FlowRow` 10 `Option<String>` metadata fields (Task 4); `flow_row_to_exported(&FlowRow) -> ExportedFlow`.
+- Produces (acceptance): the Phase 6 lossless invariant `FlowRow -> ExportedFlow -> FlowRow` now COVERS metadata — this is what keeps the Fix-B pending-counter drain assumption sound when rows traverse Kafka. Completion condition (Task 1 reviewer handoff): ZERO `None`-hardcoded metadata lines remain in `flow_row_to_exported`.
+
+- [ ] **Step 1: Write the failing test**
+
+In `crates/sentinel-sink/src/adapter.rs`, inside the existing `#[cfg(test)] mod tests`, add:
+
+```rust
+    #[test]
+    fn metadata_survives_the_sink_roundtrip() {
+        let mut row = FlowRow::try_from(&sample_exported()).unwrap();
+        row.source_namespace = Some("prod".to_string());
+        row.source_pod = Some("web-7f9c".to_string());
+        row.source_deployment = Some("web".to_string());
+        row.source_service = Some("web-svc".to_string());
+        row.source_app = Some("web".to_string());
+        row.destination_pod = Some("billing-2d4e".to_string());
+
+        let exported = flow_row_to_exported(&row);
+        assert_eq!(exported.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(exported.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(exported.destination_pod.as_deref(), Some("billing-2d4e"));
+
+        // Lossless invariant: rebuilding the row must reproduce every field.
+        assert_eq!(FlowRow::try_from(&exported).unwrap(), row);
+    }
+```
+
+- [ ] **Step 2: Run tests to verify the new test fails**
+
+Run: `cargo nextest run -p sentinel-sink`
+Expected: FAIL — `flow_row_to_exported` hardcodes `None` for all 10 metadata fields.
+
+- [ ] **Step 3: Replace the hardcoded `None`s with real copies**
+
+In `flow_row_to_exported`, replace the 10 `None`-hardcoded lines (the block after `sensor_node`) with:
+
+```rust
+        source_namespace: row.source_namespace.clone(),
+        source_pod: row.source_pod.clone(),
+        source_deployment: row.source_deployment.clone(),
+        source_service: row.source_service.clone(),
+        source_app: row.source_app.clone(),
+        destination_namespace: row.destination_namespace.clone(),
+        destination_pod: row.destination_pod.clone(),
+        destination_deployment: row.destination_deployment.clone(),
+        destination_service: row.destination_service.clone(),
+        destination_app: row.destination_app.clone(),
+```
+
+Verify afterwards: `grep -c "None" crates/sentinel-sink/src/adapter.rs` should show `None` only in `sample_exported` (the test helper keeps `None` deliberately) — zero inside `flow_row_to_exported`.
+
+- [ ] **Step 4: Run all gates**
+
+Run: `cargo nextest run --workspace && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check`
+Expected: 156 passed (155 + 1); clippy/fmt clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/sentinel-sink/src/adapter.rs
+git commit -m "feat(sink): carry kubernetes metadata through the sink adapter"
+```
+
+### Task 7: Deployment manifests and kind E2E runbook (docs only)
+
+**Files:**
+- Create: `deploy/k8s/rbac.yaml`
+- Create: `deploy/k8s/daemonset.yaml`
+- Create: `docs/runbooks/kubernetes-e2e.md`
+
+**Interfaces:**
+- Consumes: `kubernetes.enabled` config (Task 5), `HOSTNAME` env → `sensor_node` (existing main.rs behavior).
+- Produces (spec D7/D8): read-only RBAC for the 6 watched resource kinds; DaemonSet with `hostNetwork: true`; manual kind acceptance run with the ≥ 95% enrichment query. No code changes; test count stays 156.
+
+- [ ] **Step 1: Create deploy/k8s/rbac.yaml**
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinel-sensor
+  namespace: sentinel
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sentinel-sensor-reader
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [replicasets, statefulsets, daemonsets, deployments]
+    verbs: [get, list, watch]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sentinel-sensor-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sentinel-sensor-reader
+subjects:
+  - kind: ServiceAccount
+    name: sentinel-sensor
+    namespace: sentinel
+```
+
+- [ ] **Step 2: Create deploy/k8s/daemonset.yaml**
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sentinel-sensor
+  namespace: sentinel
+  labels:
+    app.kubernetes.io/name: sentinel-sensor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel-sensor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinel-sensor
+    spec:
+      serviceAccountName: sentinel-sensor
+      hostNetwork: true
+      containers:
+        - name: sensor
+          image: ghcr.io/jacobryu/sentinel-flow-sensor:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sentinel
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: sentinel-sensor-config
+```
+
+- [ ] **Step 3: Create docs/runbooks/kubernetes-e2e.md**
+
+````markdown
+# Kubernetes enrichment E2E runbook
+
+Manual acceptance for the Phase 7 enrichment (spec D8): ≥ 95% of flows
+carrying pod metadata. Runs outside CI; needs kind, kubectl, Docker, and a
+ClickHouse endpoint reachable from the cluster.
+
+## 1. Create the cluster and load the image
+
+```bash
+kind create cluster --name sentinel
+docker build -f deploy/Dockerfile.sensor -t sentinel-sensor:e2e .   # build once
+kind load docker-image sentinel-sensor:e2e --name sentinel
+```
+
+## 2. Apply RBAC and the DaemonSet
+
+```bash
+kubectl create namespace sentinel
+kubectl apply -f deploy/k8s/rbac.yaml
+kubectl create configmap sentinel-sensor-config --from-file=sensor.yaml=config/sensor.yaml -n sentinel
+# config/sensor.yaml must have kubernetes.enabled: true for this run
+# (and an output target reachable from the cluster, e.g. the Kafka transport)
+kubectl apply -f deploy/k8s/daemonset.yaml
+```
+
+Wait for the sensor to be ready and confirm the informers connected:
+
+```bash
+kubectl -n sentinel logs daemonset/sentinel-sensor | head -50
+kubectl -n sentinel get pods -o wide
+```
+
+## 3. Generate traffic inside the cluster
+
+Run a pod that talks to a Service so the flow IPs resolve to pod/endpoint
+metadata (e.g. two busybox pods exchanging HTTP over an in-cluster service).
+
+## 4. Verify the acceptance query in ClickHouse
+
+```sql
+SELECT
+  countIf(source_pod IS NOT NULL) AS enriched,
+  count() AS total,
+  enriched / total AS ratio
+FROM network_flows;
+```
+
+Acceptance: `ratio >= 0.95`.
+
+Known caveat (by design): host-network flows (node IPs) carry NULL metadata;
+exclude them from the denominator if they dominate:
+
+```sql
+SELECT countIf(source_pod IS NOT NULL) / count()
+FROM network_flows
+WHERE source_namespace != '';
+```
+
+## 5. Tear down
+
+```bash
+kind delete cluster --name sentinel
+```
+````
+
+- [ ] **Step 4: Run all gates (docs only)**
+
+Run: `cargo nextest run --workspace && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check`
+Expected: 156 passed unchanged; clippy/fmt clean.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add deploy/k8s/rbac.yaml deploy/k8s/daemonset.yaml docs/runbooks/kubernetes-e2e.md
+git commit -m "docs: kubernetes deployment manifests and e2e runbook"
+```
+
+---
+
+### Task 8: Final verification
+
+No commit unless a fix is needed. Verify the whole feature against the spec.
+
+- [ ] **Step 1: Full gates at HEAD**
+
+Run: `cargo nextest run --workspace && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo fmt --all -- --check && cargo deny check`
+Expected: all clean; report final test count (156 expected).
+
+- [ ] **Step 2: Spec acceptance traceability**
+
+Check each spec acceptance/decision bullet against the implementation and report the mapping:
+1. D1 flows-only: 10 `network_flows` columns; `security_events` untouched.
+2. D2: `ensure_schema` runs idempotent ALTERs (Task 4 code).
+3. D3: `kubernetes.enabled` default false; disabled = no connection, NULL columns, gauge 0 (Tasks 3/5).
+4. D4: ownerReferences traversal pod → RS/STS/DS → Deployment (Task 2).
+5. D5: EndpointSlice → Service (Task 2).
+6. D6: DELETE eviction + 10-min TTL (Task 2).
+7. D7: rbac.yaml + daemonset.yaml (Task 7).
+8. D8: unit tests + manual kind runbook with the ≥ 95% query (Tasks 2-7).
+9. D9: enrichment at sensor export time on all 3 export paths (Task 5).
+10. Lossless invariant: FlowRow → ExportedFlow → FlowRow covers metadata (Tasks 1/4/6).
+
+- [ ] **Step 3: Working tree hygiene**
+
+Run: `git status --short`
+Expected: only the user's own files remain modified/untracked (`README.md`, `docs/configuration.md`, `docs/posts/`, `.ua/`) — none staged or committed by any task.
+
+---
+
+## Self-Review Checklist (completed at plan-writing time)
+
+- **Spec coverage:** D1-D9 mapped to Tasks 1-8 (see Task 8 Step 2 traceability list). Out-of-scope items (security_events.source_pod, DNS/OQ-006, host-network IPs, install tooling) intentionally absent.
+- **Type consistency:** `ExportedFlow` 10 fields (Task 1, frozen order) mirrored by `FlowRow` (Task 4) and the adapter copies (Task 6); `enrich(&self, ip: &IpAddr, now: Instant)` signature from Task 2 used verbatim in Tasks 2/5; `KubernetesRuntime::start(client, enricher, metrics)` from Task 3 called in Task 5.
+- **Known risks:** kube 0.87 API drift at implementation time (adapter mechanically + report, per Global Constraints); `apply_pod`/`normalize_ip` exact signatures pinned by Task 2's committed code — Task 5's test adapts to the real API and reports; `kube` direct dep in the sensor is provisional (drop if reachable via enrichment re-exports).
