@@ -35,16 +35,16 @@ pub fn flow_row_to_exported(row: &FlowRow) -> ExportedFlow {
             .map(|(_, name)| name.to_string())
             .collect(),
         sensor_node: row.sensor_node.clone(),
-        source_namespace: None,
-        source_pod: None,
-        source_deployment: None,
-        source_service: None,
-        source_app: None,
-        destination_namespace: None,
-        destination_pod: None,
-        destination_deployment: None,
-        destination_service: None,
-        destination_app: None,
+        source_namespace: row.source_namespace.clone(),
+        source_pod: row.source_pod.clone(),
+        source_deployment: row.source_deployment.clone(),
+        source_service: row.source_service.clone(),
+        source_app: row.source_app.clone(),
+        destination_namespace: row.destination_namespace.clone(),
+        destination_pod: row.destination_pod.clone(),
+        destination_deployment: row.destination_deployment.clone(),
+        destination_service: row.destination_service.clone(),
+        destination_app: row.destination_app.clone(),
     }
 }
 
@@ -100,5 +100,24 @@ mod tests {
         assert_eq!(FlowRow::try_from(&exported).unwrap(), original);
         assert_eq!(exported.tcp_flags, vec!["SYN".to_string(), "ACK".to_string()]);
         assert_eq!(exported.duration_ms, u64::from(Duration::from_millis(1333).as_millis() as u32));
+    }
+
+    #[test]
+    fn metadata_survives_the_sink_roundtrip() {
+        let mut row = FlowRow::try_from(&sample_exported()).unwrap();
+        row.source_namespace = Some("prod".to_string());
+        row.source_pod = Some("web-7f9c".to_string());
+        row.source_deployment = Some("web".to_string());
+        row.source_service = Some("web-svc".to_string());
+        row.source_app = Some("web".to_string());
+        row.destination_pod = Some("billing-2d4e".to_string());
+
+        let exported = flow_row_to_exported(&row);
+        assert_eq!(exported.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(exported.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(exported.destination_pod.as_deref(), Some("billing-2d4e"));
+
+        // Lossless invariant: rebuilding the row must reproduce every field.
+        assert_eq!(FlowRow::try_from(&exported).unwrap(), row);
     }
 }
