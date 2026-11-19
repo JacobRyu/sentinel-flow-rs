@@ -20,6 +20,7 @@ spec:
         - name: sensor
           image: ghcr.io/jacobryu/sentinel-flow-sensor:latest
           imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/sentinel/sensor.yaml"]
           env:
             - name: HOSTNAME
               valueFrom:

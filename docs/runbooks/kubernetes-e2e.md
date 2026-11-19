@@ -8,27 +8,43 @@ ClickHouse endpoint reachable from the cluster.
 
 ```bash
 kind create cluster --name sentinel
-docker build -f deploy/Dockerfile.sensor -t sentinel-sensor:e2e .   # build once
+docker build -f Dockerfile.sensor -t sentinel-sensor:e2e .   # build once
 kind load docker-image sentinel-sensor:e2e --name sentinel
 ```
 
 ## 2. Apply RBAC and the DaemonSet
 
+1. Make sure `config/sensor.yaml` has `kubernetes.enabled: true` (the repo
+   default is `false`) and that its output target is reachable from inside the
+   cluster (e.g. the Kafka transport).
+
+2. Create the namespace and apply RBAC:
+
 ```bash
 kubectl create namespace sentinel
 kubectl apply -f deploy/k8s/rbac.yaml
-kubectl create configmap sentinel-sensor-config --from-file=sensor.yaml=config/sensor.yaml -n sentinel
-# config/sensor.yaml must have kubernetes.enabled: true for this run
-# (and an output target reachable from the cluster, e.g. the Kafka transport)
-kubectl apply -f deploy/k8s/daemonset.yaml
 ```
 
-Wait for the sensor to be ready and confirm the informers connected:
+3. Create the configmap, apply the DaemonSet, then override the published
+   image with the local e2e build:
+
+```bash
+kubectl create configmap sentinel-sensor-config --from-file=sensor.yaml=config/sensor.yaml -n sentinel
+kubectl apply -f deploy/k8s/daemonset.yaml
+kubectl -n sentinel set image daemonset/sentinel-sensor sensor=sentinel-sensor:e2e
+```
+
+4. Verify the sensor started with the mounted config (the log line is
+   `Loaded configuration from /etc/sentinel/sensor.yaml` from `main.rs`):
 
 ```bash
 kubectl -n sentinel logs daemonset/sentinel-sensor | head -50
 kubectl -n sentinel get pods -o wide
 ```
+
+Look for the `Loaded configuration from /etc/sentinel/sensor.yaml` line and no
+config error; pods should become Ready. Confirm the informers connected
+before proceeding to section 3.
 
 ## 3. Generate traffic inside the cluster
 
