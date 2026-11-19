@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sentinel-sensor
+  namespace: sentinel
+  labels:
+    app.kubernetes.io/name: sentinel-sensor
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinel-sensor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinel-sensor
+    spec:
+      serviceAccountName: sentinel-sensor
+      hostNetwork: true
+      containers:
+        - name: sensor
+          image: ghcr.io/jacobryu/sentinel-flow-sensor:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sentinel
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: sentinel-sensor-config
