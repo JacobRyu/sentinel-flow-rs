@@ -2,6 +2,7 @@ mod capture;
 mod server;
 
 use anyhow::Result;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -11,6 +12,8 @@ use tracing::{debug, error, info, warn};
 
 use capture::PacketCapture;
 use sentinel_detection::{DetectionEngine, SecurityEvent};
+use sentinel_enrichment::informer::{CacheSizeGauge, KubernetesRuntime};
+use sentinel_enrichment::kubernetes::KubernetesEnricher;
 use sentinel_flow::ExportedFlow;
 use sentinel_sensor::config::{OutputConfig, OutputMode, SensorConfig};
 use sentinel_sensor::flow::FlowProcessor;
@@ -129,6 +132,19 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Kubernetes enrichment: disabled by default. When enabled, connect
+    // fail-fast (same contract as detection rules) and start the watchers.
+    let mut enricher: Option<Arc<KubernetesEnricher>> = None;
+    let mut kubernetes_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if config.kubernetes.enabled {
+        let client = kube::Client::try_default().await?;
+        let shared = Arc::new(KubernetesEnricher::new());
+        let gauge = Arc::new(CacheSizeGaugeMetric(metrics.clone()));
+        let handles = KubernetesRuntime::start(client, shared.clone(), gauge)?;
+        kubernetes_tasks.extend(handles);
+        enricher = Some(shared);
+    }
+
     let sensor_node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
 
     // Process packets: flow aggregation + periodic sweep in one select! loop
@@ -136,6 +152,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let processor_handle = tokio::spawn({
         let metrics = metrics.clone();
+        let enricher = enricher.clone();
         async move {
             let mut detection = detection;
             let mut processor = FlowProcessor::new(&flow_config, sensor_node, metrics.clone());
@@ -159,7 +176,8 @@ async fn main() -> Result<()> {
                         metrics.packets_captured.inc();
                         metrics.bytes_captured.inc_by(packet.total_len() as u64);
 
-                        if let Some(exported) = processor.on_packet(&packet) {
+                        if let Some(mut exported) = processor.on_packet(&packet) {
+                            enrich_ip(&enricher, &mut exported);
                             info!("flow_export: {:?}", exported);
                             handle_export(&exported, &mut detection, &events_tx, &metrics);
                             forward(&out_tx, &metrics, exported);
@@ -167,7 +185,8 @@ async fn main() -> Result<()> {
                     }
                     _ = sweep_interval.tick() => {
                         debug!("active_flows={}", processor.active_flows());
-                        for exported in processor.sweep() {
+                        for mut exported in processor.sweep() {
+                            enrich_ip(&enricher, &mut exported);
                             info!("flow_export: {:?}", exported);
                             handle_export(&exported, &mut detection, &events_tx, &metrics);
                             forward(&out_tx, &metrics, exported);
@@ -181,7 +200,8 @@ async fn main() -> Result<()> {
             }
 
             // Flush remaining flows on shutdown (capture tx dropped → rx None)
-            for exported in processor.sweep() {
+            for mut exported in processor.sweep() {
+                enrich_ip(&enricher, &mut exported);
                 info!("flow_export: {:?}", exported);
                 handle_export(&exported, &mut detection, &events_tx, &metrics);
                 forward(&out_tx, &metrics, exported);
@@ -225,7 +245,11 @@ async fn main() -> Result<()> {
     }
 
     // Signal the processor first so its select! breaks even if the capture
-    // task is blocked in a sync read; then abort capture and join.
+    // task is blocked in a sync read; then abort capture and join. The
+    // Kubernetes watchers are aborted first so they do not outlive the loop.
+    for handle in kubernetes_tasks {
+        handle.abort();
+    }
     let _ = shutdown_tx.send(());
     capture_handle.abort();
     match tokio::time::timeout(Duration::from_secs(5), processor_handle).await {
@@ -254,6 +278,46 @@ async fn main() -> Result<()> {
 
     info!("SentinelFlow Sensor stopped.");
     Ok(())
+}
+
+/// Feeds the enrichment cache size into the sensor's Prometheus gauge.
+///
+/// A newtype rather than an `impl` on `SensorMetrics`: the metric lives in the
+/// sensor's lib target, so only a type local to this binary can implement the
+/// enrichment crate's trait for it.
+struct CacheSizeGaugeMetric(Arc<SensorMetrics>);
+
+impl CacheSizeGauge for CacheSizeGaugeMetric {
+    fn set_cache_size(&self, value: usize) {
+        self.0.kubernetes_cache_size.set(i64::try_from(value).unwrap_or(i64::MAX));
+    }
+}
+
+/// Enrich one exported flow in place. No-op when the enricher is disabled
+/// (spec D3) or when neither IP parses (should not happen; malformed data
+/// must not kill the capture loop).
+fn enrich_ip(enricher: &Option<Arc<KubernetesEnricher>>, exported: &mut ExportedFlow) {
+    let Some(enricher) = enricher else { return };
+    let (Ok(source), Ok(destination)) =
+        (exported.source_ip.parse::<IpAddr>(), exported.destination_ip.parse::<IpAddr>())
+    else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if let Some(metadata) = enricher.enrich(&source, now) {
+        exported.source_namespace = metadata.namespace;
+        exported.source_pod = metadata.pod;
+        exported.source_deployment = metadata.deployment;
+        exported.source_service = metadata.service;
+        exported.source_app = metadata.app;
+    }
+    if let Some(metadata) = enricher.enrich(&destination, now) {
+        exported.destination_namespace = metadata.namespace;
+        exported.destination_pod = metadata.pod;
+        exported.destination_deployment = metadata.deployment;
+        exported.destination_service = metadata.service;
+        exported.destination_app = metadata.app;
+    }
 }
 
 /// Evaluate one exported flow against the detection engine, announce and
@@ -320,5 +384,72 @@ fn forward(tx: &mpsc::Sender<ExportedFlow>, metrics: &SensorMetrics, flow: Expor
                 debug!("output channel closed, dropping flow")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_enrichment::kubernetes::PodSnapshot;
+
+    fn sample_exported() -> ExportedFlow {
+        ExportedFlow {
+            flow_id: "0c9d8e7f-1a2b-4c3d-8e4f-5a6b7c8d9e01".to_string(),
+            timestamp_start: "2026-09-25T10:00:00.123+00:00".to_string(),
+            timestamp_end: "2026-09-25T10:00:01.456+00:00".to_string(),
+            source_ip: "10.0.0.1".to_string(),
+            destination_ip: "2001:db8::1".to_string(),
+            source_port: 44321,
+            destination_port: 443,
+            protocol: "TCP".to_string(),
+            packets_forward: 10,
+            packets_reverse: 20,
+            bytes_forward: 1000,
+            bytes_reverse: 2000,
+            duration_ms: 1333,
+            tcp_flags: vec!["SYN".to_string(), "ACK".to_string()],
+            sensor_node: "node-1".to_string(),
+            source_namespace: None,
+            source_pod: None,
+            source_deployment: None,
+            source_service: None,
+            source_app: None,
+            destination_namespace: None,
+            destination_pod: None,
+            destination_deployment: None,
+            destination_service: None,
+            destination_app: None,
+        }
+    }
+
+    #[test]
+    fn enrich_ip_fills_metadata_when_enabled_and_noops_when_disabled() {
+        // Disabled path (spec D3): fields stay None.
+        let mut flow = sample_exported();
+        enrich_ip(&None, &mut flow);
+        assert_eq!(flow.source_namespace, None);
+        assert_eq!(flow.source_pod, None);
+
+        // Enabled path: a pod cached for 10.0.0.1 fills the source side only.
+        let enricher = Arc::new(KubernetesEnricher::new());
+        // `apply_pod` normalizes IPv4 to its IPv6-mapped form itself, so the
+        // raw address is the right input here.
+        enricher.apply_pod(
+            IpAddr::from([10, 0, 0, 1]),
+            PodSnapshot {
+                name: "web-7f9c".to_string(),
+                namespace: "prod".to_string(),
+                owner_uid: None,
+                labels: Default::default(),
+                node: "node-a".to_string(),
+                updated_at: std::time::Instant::now(),
+            },
+        );
+        let mut flow = sample_exported();
+        enrich_ip(&Some(enricher), &mut flow);
+        assert_eq!(flow.source_pod.as_deref(), Some("web-7f9c"));
+        assert_eq!(flow.source_namespace.as_deref(), Some("prod"));
+        assert_eq!(flow.source_deployment, None);
+        assert_eq!(flow.destination_pod, None);
     }
 }

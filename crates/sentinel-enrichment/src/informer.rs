@@ -14,7 +14,16 @@ use kube::runtime::watcher;
 use kube::{Api, Client};
 
 use crate::kubernetes::{KubernetesEnricher, OwnerKind, OwnerRef, PodSnapshot, ServiceRef};
-use sentinel_sensor::metrics::SensorMetrics;
+
+/// Sink for the enrichment cache-size gauge.
+///
+/// The sensor binary depends on this crate, so taking its concrete
+/// `SensorMetrics` here would be a package dependency cycle; the caller
+/// supplies an adapter around whatever metric handle it owns.
+pub trait CacheSizeGauge: Send + Sync {
+    /// Record the number of pod IPs currently tracked by the cache.
+    fn set_cache_size(&self, value: usize);
+}
 
 /// One snapshot per pod IP; pods without IPs (Pending) contribute nothing.
 ///
@@ -127,25 +136,25 @@ pub(crate) fn endpointslice_to_services(es: &EndpointSlice) -> Vec<(IpAddr, Serv
     entries
 }
 
-fn apply_pod_event(pod: &Pod, enricher: &KubernetesEnricher, metrics: &SensorMetrics) {
+fn apply_pod_event(pod: &Pod, enricher: &KubernetesEnricher, gauge: &dyn CacheSizeGauge) {
     // Restarted events re-list everything; upserts make that idempotent.
     for (ip, snapshot) in pod_to_snapshots(pod, Instant::now()) {
         enricher.apply_pod(ip, snapshot);
     }
-    metrics.kubernetes_cache_size.set(enricher.cache_size() as i64);
+    gauge.set_cache_size(enricher.cache_size());
 }
 
-fn remove_pod_event(pod: &Pod, enricher: &KubernetesEnricher, metrics: &SensorMetrics) {
+fn remove_pod_event(pod: &Pod, enricher: &KubernetesEnricher, gauge: &dyn CacheSizeGauge) {
     for (ip, _) in pod_to_snapshots(pod, Instant::now()) {
         enricher.remove_pod(ip);
     }
-    metrics.kubernetes_cache_size.set(enricher.cache_size() as i64);
+    gauge.set_cache_size(enricher.cache_size());
 }
 
 fn apply_replica_set_event(
     rs: &ReplicaSet,
     enricher: &KubernetesEnricher,
-    _metrics: &SensorMetrics,
+    _gauge: &dyn CacheSizeGauge,
 ) {
     if let Some((uid, owner)) = replica_set_to_owner(rs) {
         enricher.apply_owner(uid, owner);
@@ -155,14 +164,18 @@ fn apply_replica_set_event(
 fn apply_stateful_set_event(
     sts: &StatefulSet,
     enricher: &KubernetesEnricher,
-    _metrics: &SensorMetrics,
+    _gauge: &dyn CacheSizeGauge,
 ) {
     if let Some((uid, owner)) = stateful_set_to_owner(sts) {
         enricher.apply_owner(uid, owner);
     }
 }
 
-fn apply_daemon_set_event(ds: &DaemonSet, enricher: &KubernetesEnricher, _metrics: &SensorMetrics) {
+fn apply_daemon_set_event(
+    ds: &DaemonSet,
+    enricher: &KubernetesEnricher,
+    _gauge: &dyn CacheSizeGauge,
+) {
     if let Some((uid, owner)) = daemon_set_to_owner(ds) {
         enricher.apply_owner(uid, owner);
     }
@@ -171,7 +184,7 @@ fn apply_daemon_set_event(ds: &DaemonSet, enricher: &KubernetesEnricher, _metric
 fn apply_deployment_event(
     dep: &Deployment,
     enricher: &KubernetesEnricher,
-    _metrics: &SensorMetrics,
+    _gauge: &dyn CacheSizeGauge,
 ) {
     if let Some((uid, name)) = deployment_to_entry(dep) {
         enricher.apply_deployment(uid, name);
@@ -181,7 +194,7 @@ fn apply_deployment_event(
 fn apply_service_ip_event(
     es: &EndpointSlice,
     enricher: &KubernetesEnricher,
-    _metrics: &SensorMetrics,
+    _gauge: &dyn CacheSizeGauge,
 ) {
     for (ip, service) in endpointslice_to_services(es) {
         enricher.apply_service_ip(ip, service);
@@ -191,7 +204,7 @@ fn apply_service_ip_event(
 fn remove_service_ip_event(
     es: &EndpointSlice,
     enricher: &KubernetesEnricher,
-    _metrics: &SensorMetrics,
+    _gauge: &dyn CacheSizeGauge,
 ) {
     for (ip, _) in endpointslice_to_services(es) {
         enricher.remove_service_ip(ip);
@@ -200,17 +213,17 @@ fn remove_service_ip_event(
 
 /// Owners and deployments have no removal entry point in the cache; a deleted
 /// controller's UID is never reused, so leaving the stale entry is harmless.
-fn ignore_event<K>(_: &K, _: &KubernetesEnricher, _: &SensorMetrics) {}
+fn ignore_event<K>(_: &K, _: &KubernetesEnricher, _: &dyn CacheSizeGauge) {}
 
 /// One watcher task per resource kind. A stream that ends (connection loss) is
 /// restarted after a delay, so transient watch failures self-heal with a
 /// warning instead of stopping enrichment (spec §4.5). Startup connection
 /// failures surface via `Client::try_default()` in the caller (fail-fast).
 macro_rules! spawn_kind {
-    ($client:expr, $enricher:expr, $metrics:expr, $task_name:literal, $api_type:ty, $on_applied:expr, $on_deleted:expr) => {{
+    ($client:expr, $enricher:expr, $gauge:expr, $task_name:literal, $api_type:ty, $on_applied:expr, $on_deleted:expr) => {{
         let client = $client.clone();
         let enricher = $enricher.clone();
-        let metrics = $metrics.clone();
+        let gauge = $gauge.clone();
         let on_applied = $on_applied;
         let on_deleted = $on_deleted;
         tokio::spawn(async move {
@@ -221,10 +234,10 @@ macro_rules! spawn_kind {
                     match event {
                         Ok(watcher::Event::Apply(object))
                         | Ok(watcher::Event::InitApply(object)) => {
-                            on_applied(&object, &enricher, &metrics);
+                            on_applied(&object, &enricher, gauge.as_ref());
                         }
                         Ok(watcher::Event::Delete(object)) => {
-                            on_deleted(&object, &enricher, &metrics);
+                            on_deleted(&object, &enricher, gauge.as_ref());
                         }
                         // Re-list boundaries: objects arrive via InitApply, and the
                         // completed list needs no separate action because upserts
@@ -251,13 +264,13 @@ impl KubernetesRuntime {
     pub fn start(
         client: Client,
         enricher: Arc<KubernetesEnricher>,
-        metrics: Arc<SensorMetrics>,
+        gauge: Arc<dyn CacheSizeGauge>,
     ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
         let mut handles = Vec::with_capacity(6);
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "pods",
             Pod,
             apply_pod_event,
@@ -266,7 +279,7 @@ impl KubernetesRuntime {
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "replicasets",
             ReplicaSet,
             apply_replica_set_event,
@@ -275,7 +288,7 @@ impl KubernetesRuntime {
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "statefulsets",
             StatefulSet,
             apply_stateful_set_event,
@@ -284,7 +297,7 @@ impl KubernetesRuntime {
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "daemonsets",
             DaemonSet,
             apply_daemon_set_event,
@@ -293,7 +306,7 @@ impl KubernetesRuntime {
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "deployments",
             Deployment,
             apply_deployment_event,
@@ -302,7 +315,7 @@ impl KubernetesRuntime {
         handles.push(spawn_kind!(
             client,
             enricher,
-            metrics,
+            gauge,
             "endpointslices",
             EndpointSlice,
             apply_service_ip_event,

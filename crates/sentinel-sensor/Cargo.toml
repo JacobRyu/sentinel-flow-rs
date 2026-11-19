@@ -32,3 +32,5 @@ pnet = { workspace = true, features = ["pnet_datalink"] }
 sentinel-parser = { path = "../sentinel-parser" }
 sentinel-flow = { path = "../sentinel-flow" }
 sentinel-detection = { path = "../sentinel-detection" }
+sentinel-enrichment = { path = "../sentinel-enrichment" }
+kube = { workspace = true }

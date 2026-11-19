@@ -11,6 +11,9 @@ ignore = [
   # serde_yaml 0.9 is archived (unmaintained); yanked unsafe-libyaml stays pinned until
   # the deserializer is migrated to a maintained fork (tracked for a dedicated chore)
   "RUSTSEC-2024-0449",
+  # chrono is unmaintained (all versions, no upgrade path); direct sensor dep and reachable via
+  # k8s-openapi, so it cannot leave the graph. Revisit when chrono is replaced (follow-up chore).
+  "RUSTSEC-2026-0543",
 ]
 
 [licenses]

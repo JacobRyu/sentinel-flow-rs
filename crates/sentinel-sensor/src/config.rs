@@ -154,6 +154,14 @@ impl Default for MetricsConfig {
     }
 }
 
+/// Kubernetes enrichment settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KubernetesConfig {
+    /// Connect to the cluster and enrich flows at export time (default: off).
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// Main sensor configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SensorConfig {
@@ -171,6 +179,10 @@ pub struct SensorConfig {
 
     /// Metrics settings
     pub metrics: MetricsConfig,
+
+    /// Kubernetes enrichment settings
+    #[serde(default)]
+    pub kubernetes: KubernetesConfig,
 }
 
 impl SensorConfig {
@@ -279,5 +291,19 @@ mod tests {
         assert_eq!(output.mode, OutputMode::Kafka);
         assert_eq!(output.kafka.brokers, vec!["localhost:9092".to_string()]);
         assert_eq!(output.kafka.topic, "netflow.raw");
+    }
+
+    #[test]
+    fn kubernetes_defaults_to_disabled() {
+        let config = SensorConfig::default();
+        assert!(!config.kubernetes.enabled);
+    }
+
+    #[test]
+    fn kubernetes_enabled_parses() {
+        let kubernetes: KubernetesConfig = serde_yaml::from_str("enabled: true").unwrap();
+        assert!(kubernetes.enabled);
+        let kubernetes: KubernetesConfig = serde_yaml::from_str("").unwrap();
+        assert!(!kubernetes.enabled);
     }
 }

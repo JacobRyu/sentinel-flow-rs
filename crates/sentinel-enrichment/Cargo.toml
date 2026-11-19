@@ -17,4 +17,3 @@ tracing = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
 sentinel-flow = { path = "../sentinel-flow" }
-sentinel-sensor = { path = "../sentinel-sensor" }

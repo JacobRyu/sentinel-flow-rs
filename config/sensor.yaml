@@ -27,3 +27,6 @@ detection:
 metrics:
   enabled: true
   port: 9090
+
+kubernetes:
+  enabled: false
