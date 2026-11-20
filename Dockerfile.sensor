@@ -17,7 +17,9 @@ COPY crates/ crates/
 RUN cargo build --release --bin sentinel-sensor
 
 # Runtime stage
-FROM debian:bookworm-slim
+# Matches the builder base (trixie) so the glibc in the runtime image is never
+# older than the one the binary was linked against.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
