@@ -5,9 +5,11 @@ use chrono::SecondsFormat;
 use sentinel_flow::ExportedFlow;
 use sentinel_sensor::output::FlowRow;
 
-/// Canonical (bit, name) pairs, mirroring row.rs's flag encoding.
+/// Canonical (bit, name) pairs in the sensor's canonical order
+/// (`TcpFlags::to_vec`), so a sink round-trip preserves the sensor's
+/// byte-exact `tcp_flags_seen` ordering.
 const FLAG_NAMES: [(u8, &str); 6] =
-    [(1, "FIN"), (2, "SYN"), (4, "RST"), (8, "PSH"), (16, "ACK"), (32, "URG")];
+    [(2, "SYN"), (16, "ACK"), (1, "FIN"), (4, "RST"), (8, "PSH"), (32, "URG")];
 
 /// Rebuild an `ExportedFlow` from a deserialized `FlowRow` so the row can be
 /// pushed into the sensor's `FlowWriter`, which converts it back to a `FlowRow`
@@ -119,5 +121,15 @@ mod tests {
 
         // Lossless invariant: rebuilding the row must reproduce every field.
         assert_eq!(FlowRow::try_from(&exported).unwrap(), row);
+    }
+
+    #[test]
+    fn sensor_tcp_flag_order_survives_the_adapter_roundtrip() {
+        // `tcp_flags_seen` is in the sensor's canonical order (ACK before RST,
+        // per `TcpFlags::to_vec`); the adapter must round-trip it exactly.
+        let mut row = FlowRow::try_from(&sample_exported()).unwrap();
+        row.tcp_flags_seen = vec![16, 4]; // ACK, RST
+        let round_tripped = FlowRow::try_from(&flow_row_to_exported(&row)).unwrap().tcp_flags_seen;
+        assert_eq!(round_tripped, vec![16, 4]);
     }
 }

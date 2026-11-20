@@ -302,8 +302,8 @@ impl CacheSizeGauge for CacheSizeGaugeMetric {
 }
 
 /// Enrich one exported flow in place. No-op when the enricher is disabled
-/// (spec D3) or when neither IP parses (should not happen; malformed data
-/// must not kill the capture loop).
+/// (spec D3) or when either IP fails to parse (should not happen; malformed
+/// data must not kill the capture loop).
 fn enrich_ip(enricher: &Option<Arc<KubernetesEnricher>>, exported: &mut ExportedFlow) {
     let Some(enricher) = enricher else { return };
     let (Ok(source), Ok(destination)) =

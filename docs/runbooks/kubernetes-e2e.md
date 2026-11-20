@@ -14,9 +14,17 @@ kind load docker-image sentinel-sensor:e2e --name sentinel
 
 ## 2. Apply RBAC and the DaemonSet
 
-1. Make sure `config/sensor.yaml` has `kubernetes.enabled: true` (the repo
-   default is `false`) and that its output target is reachable from inside the
-   cluster (e.g. the Kafka transport).
+1. Enable `kubernetes.enabled: true` in `config/sensor.yaml` and make sure its
+   output target is reachable from inside the cluster (e.g. the Kafka
+   transport):
+
+   ```bash
+   # Repo default: kubernetes.enabled is false in config/sensor.yaml.
+   sed -i.bak 's/^  enabled: false$/  enabled: true/' config/sensor.yaml && rm -f config/sensor.yaml.bak
+   ```
+
+   Verify with `grep -A1 '^kubernetes:' config/sensor.yaml`; the `enabled:` line
+   must read `true`.
 
 2. Create the namespace and apply RBAC:
 
