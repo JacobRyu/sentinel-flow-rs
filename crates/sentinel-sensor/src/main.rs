@@ -138,6 +138,14 @@ async fn main() -> Result<()> {
     let mut kubernetes_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     if config.kubernetes.enabled {
         let client = kube::Client::try_default().await?;
+        // `try_default()` only infers configuration; probe the API once so an
+        // enabled-but-unreachable cluster fails startup (same contract as the
+        // detection rules file) instead of silently serving unenriched flows.
+        let version =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.apiserver_version())
+                .await
+                .map_err(|_| anyhow::anyhow!("kubernetes API probe timed out after 5s"))??;
+        info!("kubernetes API reachable (git version {})", version.git_version);
         let shared = Arc::new(KubernetesEnricher::new());
         let gauge = Arc::new(CacheSizeGaugeMetric(metrics.clone()));
         let handles = KubernetesRuntime::start(client, shared.clone(), gauge)?;
